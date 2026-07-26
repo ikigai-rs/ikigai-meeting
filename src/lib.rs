@@ -610,4 +610,23 @@ mod tests {
             "{err:?}"
         );
     }
+
+    #[test]
+    fn base64_encode_matches_rfc4648_vectors() {
+        // A self-consistent encoder passes the auth-header test yet could still be WRONG — the
+        // fake transport can't catch that. RFC 4648 §10's vectors exercise every padding case
+        // (0, 1, 2 `=`) and pin the encoder to correct, so the HTTP Basic header is real base64.
+        for (input, want) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+            ("hello", "aGVsbG8="),
+        ] {
+            assert_eq!(base64_encode(input.as_bytes()), want, "base64({input:?})");
+        }
+    }
 }
