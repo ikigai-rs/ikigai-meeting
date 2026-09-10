@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-meeting"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -14,9 +14,9 @@ categories = ["web-programming"]
 ikigai-core = "0.1.46"
 # The HTTP I/O seam (HttpTransport) + wire types. The host injects one transport
 # (ureq/reqwest natively, fetch in the browser); no HTTP client or executor is baked in.
-# 0.1.4 is the true minimum — HttpRequest/HttpResponse/Method/net_allows — and it matches the
-# ikigai-cli workspace, so a consumer resolves one ikigai-http, not two.
-ikigai-http = "0.1.4"
+# 0.1.7 is the true minimum: `net_allows_port` (the port-aware ACL the host gate uses, so a
+# port-scoped grant is enforced exactly) arrived there, with the bare-scope deny.
+ikigai-http = "0.1.7"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -25,3 +25,7 @@ url = "2"
 
 [dev-dependencies]
 futures = "0.3"
+# The module recipe as one test (`tests/conformance.rs`). Its own floor on
+# ikigai-core (0.1.67) is above the library's; the library's pin above stays the
+# true minimum of the API the LIBRARY uses.
+ikigai-conformance = "0.1.0"

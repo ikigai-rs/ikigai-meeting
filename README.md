@@ -12,11 +12,17 @@ without re-plumbing at each destination.
 
 ## Faces
 
-`Sink urn:meeting:zoom:schedule topic=… start=… [duration=30] [timezone=…] [agenda=…]`
+`Sink urn:meeting:zoom:schedule topic=… start=… [duration=30] [timezone=…] [agenda=…] [as=…]`
+
+Every input is typed in the manifold (`topic` `xsd:string`, `start` `xsd:dateTime`, `duration`
+`xsd:integer`, …) and held to its type: a garbled value is a typed `InvalidArgument` that names
+the input and never echoes the value. A piped value — or a top-level `sink`'s body — arrives as
+`content` and is the **agenda** (a named `agenda` wins).
 
 - default (`text/plain`) → the **join URL** (what an invite needs)
-- `as=text/turtle` → the **shareable graph** (join-safe: `ical:conference`, passcode, id — the host
-  start URL is deliberately withheld)
+- `as=text/turtle` → the **shareable graph** (join-safe: an `ical:Vevent` with `ical:conference`,
+  `dcterms:identifier`, `schema:provider`, the passcode — the host start URL is deliberately
+  withheld)
 - `as=application/json` → the **full envelope** for the trusted caller, including the host
   `start_url` (which carries a start token)
 
@@ -30,8 +36,16 @@ Like ikigai-llm, no HTTP client and no keystore are baked in. The host injects:
 
 ## Capabilities
 
-The backend refuses before the socket unless the caller holds the net grant for the Zoom hosts
-(`urn:cap:net:zoom.us`, `urn:cap:net:api.zoom.us`); the meeting action is `urn:cap:meeting:zoom:schedule`.
+The Sink declares `urn:cap:net:*` and `urn:cap:secret:read:*`, so the kernel refuses a caller
+holding no grant under either family before the endpoint runs. The backend's own rules then
+require the two Zoom hosts (`urn:cap:net:zoom.us`, `urn:cap:net:api.zoom.us` — port-aware) and
+each credential's name (`urn:cap:secret:read:zoom-account-id`, `…:zoom-client-id`,
+`…:zoom-client-secret`). Every refusal is a typed `Denied` issued **before any secret is read and
+before any socket opens**; the injected `SecretReader` is never asked.
+
+An error never carries a credential or the request's text: a server's 4xx contributes only its
+`message`, a transport's text is scrubbed of every credential value, an invalid input is named,
+not echoed.
 
 ## Zoom setup (one-time, host side)
 
@@ -45,6 +59,16 @@ The backend refuses before the socket unless the caller holds the net grant for 
 
 The logic is covered by hermetic tests against a fake transport, so no live credentials are needed
 to build or test — only to place a real call.
+
+## Conformance
+
+`tests/conformance.rs` runs [`ikigai-conformance`](https://github.com/ikigai-rs/ikigai-conformance)
+over the module's kernel against a loopback Zoom (the suite fires the Sink; nothing reaches the
+real API), and pins by hand what the suite cannot see: the denial precedes every read and every
+socket, a schedule is never cached, every declared face is the face served, no error carries a
+credential or request text. One line remains in the report — `ik:passcode`, the term the shared
+vocabulary does not define yet — and the id `urn:meeting:zoom:schedule` is a live MCP tool name,
+renamed in wave two.
 
 ## Status
 
