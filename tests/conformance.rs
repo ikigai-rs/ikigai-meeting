@@ -28,10 +28,9 @@
 //!   cannot carry this (it drops the invoking checks and leaves NAMES running), so
 //!   [`names_are_wave_two`] pins the one finding the pass will flip.
 //! - No opt-outs: every firing lands on the stub. No module namespace: the Turtle
-//!   face uses `ical:`, `dcterms:` and `schema:` — and ONE `ik:` term the shared
-//!   vocabulary does not define, `ik:passcode`, which is the report's single line
-//!   (once per entry) until a vocabulary arc defines it ([`conforms`] pins exactly
-//!   that line).
+//!   face uses `ical:`, `dcterms:` and `schema:`, plus the one `ik:` term the shared
+//!   vocabulary defines for it, `ik:passcode` (`ikigai-vocab` 0.1.69). The walk is
+//!   clean — [`conforms`] asserts exactly that, with no term carved out.
 //!
 //! ## What the suite cannot see, pinned by hand
 //!
@@ -477,18 +476,10 @@ fn conforms() {
     // Printed even when clean (`--nocapture`): the report is the record.
     eprintln!("{report}");
 
-    // The report's one line, once per entry (the face is walked per entry, so the
-    // facade repeats it): `ik:passcode`, the term the shared vocabulary lacks.
-    // When a vocabulary arc defines it this assertion flips and the pin comes out.
-    assert_eq!(report.findings.len(), ENTRIES.len(), "{report}");
-    for finding in &report.findings {
-        assert_eq!(finding.check, Check::Vocabulary, "{report}");
-        assert_eq!(finding.endpoint, ID, "{report}");
-        assert!(
-            finding.detail.contains("https://ikigai-rs.dev/ns#passcode"),
-            "{report}"
-        );
-    }
+    // Clean, with nothing carved out: `ik:passcode` — the Turtle face's one `ik:`
+    // term, and the module's last VOCABULARY finding — is defined by the shared
+    // vocabulary as of `ikigai-vocab` 0.1.69.
+    assert!(report.is_clean(), "{report}");
 
     // One description, two entries, one Sink action each; only NAMES skipped;
     // nothing declared.

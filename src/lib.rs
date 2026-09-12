@@ -602,9 +602,12 @@ impl Meeting {
     /// `ical:conference` is the join URL (RFC 7986's CONFERENCE property, a URI; an ICS generator
     /// maps it to a `CONFERENCE:` line + the event's link), `dcterms:identifier` the provider's
     /// meeting id and `schema:provider` the provider. The host `start_url` is deliberately
-    /// withheld. `ik:passcode` is the one term the shared vocabulary does not define yet (a
-    /// numeric passcode has no well-known home: RFC 7986 carries a passcode only inside a
-    /// conference URI, and Zoom's `pwd=` is an encrypted token, not the code).
+    /// withheld. `ik:passcode` is the shared vocabulary's own term (`ikigai-vocab` 0.1.69,
+    /// `rdfs:range xsd:string`, no `rdfs:domain` — its subject is `ical:Vevent`, an external
+    /// class, and that vocabulary declares domains only for its own classes): the code a
+    /// participant types has no well-known home, because RFC 7986 carries a passcode only
+    /// inside a conference URI and Zoom's `pwd=` is an encrypted token, not the code. It is
+    /// emitted as a string literal, never a number — leading zeros are significant.
     fn turtle(&self) -> Vec<u8> {
         let mut s = String::new();
         s.push_str("@prefix ik: <https://ikigai-rs.dev/ns#> .\n");
