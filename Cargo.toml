@@ -28,4 +28,4 @@ futures = "0.3"
 # The module recipe as one test (`tests/conformance.rs`). Its own floor on
 # ikigai-core (0.1.67) is above the library's; the library's pin above stays the
 # true minimum of the API the LIBRARY uses.
-ikigai-conformance = "0.1.0"
+ikigai-conformance = "0.2.0"
