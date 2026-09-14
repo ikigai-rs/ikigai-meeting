@@ -3,8 +3,9 @@
 Video-conference scheduling as [ikigai](https://ikigai-rs.dev) ROC resources.
 
 `urn:meeting:schedule` is a provider-agnostic **facade** that dispatches to pluggable backends
-`urn:meeting:<provider>:schedule` — the same shape as `urn:llm:ask`. **Slice 0** ships a **Zoom**
-backend over Server-to-Server OAuth.
+`urn:meeting:<provider>:schedule` — the same shape as `urn:llm:ask`. **One backend ships today:
+Zoom**, over Server-to-Server OAuth. Adding another means adding an endpoint under its own
+provider IRI; the facade needs no change.
 
 The scheduled meeting's join URL is emitted as **`ical:conference`** (RFC 7986's CONFERENCE
 property), so one value flows into the `.ics`, the calendar event, and — later — an org entry,
@@ -67,10 +68,12 @@ over the module's kernel against a loopback Zoom (the suite fires the Sink; noth
 real API), and pins by hand what the suite cannot see: the denial precedes every read and every
 socket, a schedule is never cached, every declared face is the face served, no error carries a
 credential or request text. One line remains in the report — `ik:passcode`, the term the shared
-vocabulary does not define yet — and the id `urn:meeting:zoom:schedule` is a live MCP tool name,
-renamed in wave two.
+vocabulary does not define yet. ⚠ The id `urn:meeting:zoom:schedule` is also a live MCP tool
+name, so renaming it is a breaking change for any agent already holding that tool.
 
 ## Status
 
-Slice 0: `urn:meeting:zoom:schedule` (schedule only). Next: cancel/reschedule, Google Meet / Teams
-backends, and the org-entry scheduling path.
+**`urn:meeting:zoom:schedule` schedules; nothing here cancels or reschedules.** For it to work a
+host must bind this crate's space *and* supply a `SecretReader`, with the three Zoom credentials
+stored under the names "Zoom setup" gives. Google Meet and Teams backends, and the org-entry
+scheduling path, do not exist yet.
