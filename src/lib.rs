@@ -28,9 +28,9 @@
 //! An error travels through traces, logs and MCP replies, so nothing a credential or a caller
 //! put into the request comes back in one. A server's 4xx contributes only its `message` /
 //! `reason` / `error` field (a body that echoes the request is dropped); a transport's text is
-//! scrubbed of every credential value (a transport that names the URL would otherwise name the
-//! account id, which rides in the token request's query); an invalid input is named, never
-//! echoed.
+//! scrubbed of every credential value (a transport that echoes the request it could not send would
+//! otherwise name the account id, which rides in the token request's form body); an invalid input
+//! is named, never echoed.
 //!
 //! ## Field shapes
 //!
@@ -118,8 +118,8 @@ impl ZoomConfig {
         ]
     }
 
-    /// The token endpoint, without its query (the account id rides in the query and is a
-    /// credential — the gated and reported URL never carries it).
+    /// The token endpoint. It carries no query: the account id is a credential and rides in the
+    /// form body, so no URL this module sends, gates or reports ever names it.
     fn token_url(&self) -> String {
         format!("{}/oauth/token", self.oauth_base.trim_end_matches('/'))
     }
@@ -344,14 +344,13 @@ impl ZoomBackend {
     }
 
     /// Exchange the S2S credentials for a short-lived bearer token.
-    /// `POST {oauth_base}/oauth/token?grant_type=account_credentials&account_id=…`, HTTP Basic
-    /// `client_id:client_secret`. (No caching in Slice 0 — a booking approval is rare; caching the
+    /// `POST {oauth_base}/oauth/token`, HTTP Basic `client_id:client_secret`, with
+    /// `grant_type=account_credentials&account_id=…` as an `application/x-www-form-urlencoded`
+    /// body — RFC 6749 §4.4.2's client-credentials request. Zoom's own examples put those two
+    /// parameters in the QUERY; the body keeps the account id (a credential) out of every URL a
+    /// host transport might log. (No caching in Slice 0 — a booking approval is rare; caching the
     /// ~1h token is a later optimization.)
     async fn access_token(&self, token_url: &str, creds: &Credentials) -> Result<String> {
-        let url = format!(
-            "{token_url}?grant_type=account_credentials&account_id={}",
-            creds.account_id
-        );
         let basic =
             base64_encode(format!("{}:{}", creds.client_id, creds.client_secret).as_bytes());
         let secrets = [
@@ -364,7 +363,7 @@ impl ZoomBackend {
             .transport
             .send(HttpRequest {
                 method: Method::Post,
-                url,
+                url: token_url.to_string(),
                 headers: vec![
                     ("Authorization".to_string(), format!("Basic {basic}")),
                     (
@@ -372,7 +371,7 @@ impl ZoomBackend {
                         "application/x-www-form-urlencoded".to_string(),
                     ),
                 ],
-                body: Vec::new(),
+                body: token_form(&creds.account_id),
             })
             .await
             .map_err(|e| {
@@ -499,7 +498,7 @@ fn invalid(name: &str, detail: &str) -> Error {
 
 /// Refuse before the socket if the capability doesn't grant this URL's host (and port) — so a
 /// declared `urn:cap:net:*` is enforced per host, not merely offered. The message names the host,
-/// never the URL: the token URL's query carries a credential.
+/// never the URL: a URL is the caller's to configure, and a host is all the refusal needs.
 fn gate_net(inv: &Invocation<'_>, url: &str) -> Result<()> {
     let parsed = url::Url::parse(url).map_err(|e| Error::Endpoint(format!("bad url: {e}")))?;
     let host = parsed.host_str().unwrap_or("");
@@ -656,9 +655,35 @@ fn repr(content_type: &str, body: Vec<u8>) -> Representation {
     Representation::new(ReprType::new(content_type), body)
 }
 
-/// A Turtle string literal (quote-and-escape).
+/// The S2S token request's form body: `grant_type=account_credentials&account_id=…`,
+/// `application/x-www-form-urlencoded`, so an account id holding `&`, `=`, `+` or a space is one
+/// value, not several.
+fn token_form(account_id: &str) -> Vec<u8> {
+    url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "account_credentials")
+        .append_pair("account_id", account_id)
+        .finish()
+        .into_bytes()
+}
+
+/// A Turtle string literal (quote-and-escape). A `"`-quoted Turtle string may not hold a raw `"`,
+/// `\`, line feed or carriage return (Turtle grammar production 22, `STRING_LITERAL_QUOTE`), so
+/// those four are escaped and everything else passes through: a topic with a line break is the
+/// same term in this face and the JSON one.
 fn ttl_str(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// A Turtle IRI reference. Characters an IRIREF cannot carry (Turtle §19: `<>"{}|^\``, space
@@ -857,7 +882,12 @@ mod tests {
             "{:?}",
             oauth.headers
         );
-        assert!(oauth.url.contains("account_id=acct-1"), "{}", oauth.url);
+        assert!(oauth.url.ends_with("/oauth/token"), "{}", oauth.url);
+        assert!(!oauth.url.contains("acct-1"), "{}", oauth.url);
+        assert_eq!(
+            oauth.body,
+            b"grant_type=account_credentials&account_id=acct-1".to_vec()
+        );
         let create = seen.iter().find(|r| r.url.contains("/meetings")).unwrap();
         assert!(create
             .headers
@@ -980,6 +1010,34 @@ mod tests {
         assert_eq!(
             server_error("oauth", 502, b"<html>Bearer tok</html>"),
             "zoom oauth returned 502 (23 bytes, not JSON)"
+        );
+    }
+
+    #[test]
+    fn token_form_encodes_the_account_id_as_one_value() {
+        assert_eq!(
+            token_form("acct-1"),
+            b"grant_type=account_credentials&account_id=acct-1".to_vec()
+        );
+        let awkward = "a&b=c d+e";
+        let body = token_form(awkward);
+        let pairs: Vec<(String, String)> =
+            url::form_urlencoded::parse(&body).into_owned().collect();
+        assert_eq!(
+            pairs,
+            [
+                ("grant_type".to_string(), "account_credentials".to_string()),
+                ("account_id".to_string(), awkward.to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn ttl_str_escapes_what_a_quoted_turtle_string_cannot_carry() {
+        assert_eq!(ttl_str("plain"), "\"plain\"");
+        assert_eq!(
+            ttl_str("say \"hi\" \\ a\nb\rc\td"),
+            "\"say \\\"hi\\\" \\\\ a\\nb\\rc\td\""
         );
     }
 

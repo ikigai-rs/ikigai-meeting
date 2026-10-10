@@ -30,3 +30,9 @@ futures = "0.3"
 # The module recipe as one test (`tests/conformance.rs`). A 0.x caret is a CEILING
 # too: "0.6.0" admits 0.6.x only, so the next minor is a deliberate pin change.
 ikigai-conformance = "0.6.0"
+# The cross-face term-equality test (`tests/conformance.rs`): compares the Turtle face as
+# parsed RDF terms, and reads `ik:passcode`'s declared range from the shared vocabulary.
+# oxrdf 0.3 is the term model `ikigai_conformance::rdf::parse` returns; ikigai-vocab 0.1.69
+# is the first to define `ik:passcode`.
+oxrdf = "0.3"
+ikigai-vocab = "0.1.69"
