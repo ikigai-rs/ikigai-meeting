@@ -11,7 +11,9 @@ keywords = ["ikigai", "roc", "meeting", "zoom", "calendar"]
 categories = ["web-programming"]
 
 [dependencies]
-ikigai-core = "0.1.46"
+# 0.1.89: the floor ikigai-conformance 0.6 links (SPACE-NAME), so it is the oldest core
+# this crate's tests build against; 0.1.46 is the oldest whose API the library itself uses.
+ikigai-core = "0.1.89"
 # The HTTP I/O seam (HttpTransport) + wire types. The host injects one transport
 # (ureq/reqwest natively, fetch in the browser); no HTTP client or executor is baked in.
 # 0.1.7 is the true minimum: `net_allows_port` (the port-aware ACL the host gate uses, so a
@@ -25,7 +27,6 @@ url = "2"
 
 [dev-dependencies]
 futures = "0.3"
-# The module recipe as one test (`tests/conformance.rs`). Its own floor on
-# ikigai-core (0.1.67) is above the library's; the library's pin above stays the
-# true minimum of the API the LIBRARY uses.
-ikigai-conformance = "0.2.0"
+# The module recipe as one test (`tests/conformance.rs`). A 0.x caret is a CEILING
+# too: "0.6.0" admits 0.6.x only, so the next minor is a deliberate pin change.
+ikigai-conformance = "0.6.0"
