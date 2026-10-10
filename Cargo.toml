@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-meeting"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -11,9 +11,10 @@ keywords = ["ikigai", "roc", "meeting", "zoom", "calendar"]
 categories = ["web-programming"]
 
 [dependencies]
-# 0.1.89: the floor ikigai-conformance 0.6 links (SPACE-NAME), so it is the oldest core
-# this crate's tests build against; 0.1.46 is the oldest whose API the library itself uses.
-ikigai-core = "0.1.89"
+# 0.1.47: the library's true minimum, checked by a fresh resolve at `=0.1.47` beside
+# `ikigai-http = "=0.1.7"` (whose own floor it is). The tests build newer: ikigai-conformance
+# 0.6 links 0.1.89 (SPACE-NAME), and the dev-dependency raises the resolve, not this floor.
+ikigai-core = "0.1.47"
 # The HTTP I/O seam (HttpTransport) + wire types. The host injects one transport
 # (ureq/reqwest natively, fetch in the browser); no HTTP client or executor is baked in.
 # 0.1.7 is the true minimum: `net_allows_port` (the port-aware ACL the host gate uses, so a
