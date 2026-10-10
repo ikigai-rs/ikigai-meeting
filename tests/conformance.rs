@@ -27,6 +27,9 @@
 //!   coordinated pass (wave two, `ikigai-core-PENDING.md` §1). `Suite::opt_out`
 //!   cannot carry this (it drops the invoking checks and leaves NAMES running), so
 //!   [`names_are_wave_two`] pins the one finding the pass will flip.
+//! - `space(transport, secrets, config)` is declared HOST-named
+//!   (`Suite::host_named_space`, SPACE-NAME): it is instance-built, so its doors
+//!   answer to whatever the host handed it, and it carries no name of its own.
 //! - No opt-outs: every firing lands on the stub. No module namespace: the Turtle
 //!   face uses `ical:`, `dcterms:` and `schema:`, plus the one `ik:` term the shared
 //!   vocabulary defines for it, `ik:passcode` (`ikigai-vocab` 0.1.69). The walk is
@@ -469,9 +472,19 @@ fn minimal() -> Vec<(&'static str, &'static str)> {
 fn conforms() {
     let stub = Stub::start();
     let secrets = Arc::new(Secrets::default());
-    let kernel = kernel(&stub, secrets.clone(), "/v2");
+    // `space(transport, secrets, config)` is instance-built: its doors answer to
+    // whatever transport, keystore and Zoom bases the host handed it, so only the
+    // host knows which instance it is. Declared host-named, by value: the same
+    // space goes to the kernel and the suite.
+    let space = Arc::new(ikigai_meeting::space(
+        Arc::new(Client),
+        secrets.clone(),
+        config(&stub, "/v2"),
+    ));
+    let kernel = Kernel::new(space.clone());
     let report = Suite::new()
         .checks(Checks::all() - Checks::NAMES)
+        .host_named_space("ikigai_meeting::space(transport, secrets, config)", space)
         .run_blocking(&kernel);
     // Printed even when clean (`--nocapture`): the report is the record.
     eprintln!("{report}");
