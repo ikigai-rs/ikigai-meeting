@@ -52,7 +52,8 @@
 //!   typed `InvalidArgument` before any socket.
 //! - **No credential and no request text in an error** (PENDING #67,
 //!   [`errors_carry_no_credential_and_no_request_text`]): the module's denial, a
-//!   transport failure that names the URL (which carries the account id), a
+//!   transport failure that echoes the request it could not send (whose form
+//!   body carries the account id), a
 //!   server 4xx whose JSON body echoes the request beside its `message`, a
 //!   server 4xx whose text body echoes it, and each invalid input.
 //! - **`content` reaches the wire as the agenda**
@@ -71,6 +72,7 @@ use ikigai_conformance::{Check, Checks, Suite};
 use ikigai_core::{ArgRef, Capability, Error, Expiry, Iri, Kernel, Representation, Request, Verb};
 use ikigai_http::{HttpRequest, HttpResponse, HttpTransport};
 use ikigai_meeting::{SecretReader, ZoomConfig, CAP_NET, CAP_SECRET_READ, FACES};
+use oxrdf::{Literal, NamedNode, Term};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -104,8 +106,10 @@ const JOIN_URL: &str = "https://zoom.us/j/88899900011?pwd=abc";
 /// One request as the stub received it.
 #[derive(Clone, Debug)]
 struct Received {
+    /// The request target as it crossed the wire: the path and any query.
     path: String,
     authorization: String,
+    content_type: String,
     body: Vec<u8>,
 }
 
@@ -196,21 +200,26 @@ impl Stub {
                     let mut parts = start.split_whitespace();
                     let method = parts.next().unwrap_or("").to_string();
                     let path = parts.next().unwrap_or("/").to_string();
-                    let authorization = headers
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
-                        .map(|(_, v)| v.clone())
-                        .unwrap_or_default();
-                    let (status, reason, content_type, body_out) =
+                    let header = |name: &str| {
+                        headers
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or_default()
+                    };
+                    let authorization = header("authorization");
+                    let content_type = header("content-type");
+                    let (status, reason, response_type, body_out) =
                         respond(&method, &path, &authorization, &body);
                     received.lock().unwrap().push(Received {
                         path,
                         authorization,
+                        content_type,
                         body,
                     });
                     let head = format!(
                         "HTTP/1.1 {status} {reason}\r\nConnection: close\r\n\
-                         Content-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
+                         Content-Type: {response_type}\r\nContent-Length: {}\r\n\r\n",
                         body_out.len()
                     );
                     let _ = stream.write_all(head.as_bytes());
@@ -368,14 +377,19 @@ impl HttpTransport for Client {
     }
 }
 
-/// A transport that fails the way a real client does: naming the URL it could
-/// not reach — which, for the token request, carries the account id.
+/// A transport that fails the way a careless client does: naming the URL it
+/// could not reach and echoing the body it could not send — which, for the
+/// token request, carries the account id.
 struct Failing;
 
 #[async_trait]
 impl HttpTransport for Failing {
     async fn send(&self, request: HttpRequest) -> Result<HttpResponse, String> {
-        Err(format!("{}: connection refused", request.url))
+        Err(format!(
+            "{} ({}): connection refused",
+            request.url,
+            String::from_utf8_lossy(&request.body)
+        ))
     }
 }
 
@@ -698,8 +712,9 @@ fn declared_outputs_are_the_media_types_served() {
 
 /// The errors this module composes never carry a credential or the request's
 /// text. Each case is one way foreign text enters an error: the module's own
-/// denial (names the host, never the URL); a transport that names the URL it
-/// could not reach (the token URL's query carries the account id); a server 4xx
+/// denial (names the host, never the URL); a transport that echoes the request
+/// it could not send (the token request's form body carries the account id); a
+/// server 4xx
 /// whose JSON body echoes the request beside its `message` (only the message is
 /// kept); a server 4xx whose plain-text body echoes it (dropped, its size
 /// stated); and an invalid input (named, not echoed). An error travels through
@@ -781,7 +796,7 @@ fn errors_carry_no_credential_and_no_request_text() {
     assert!(
         errors[1].1.to_string().contains("transport error")
             && errors[1].1.to_string().contains("[redacted]"),
-        "the account id in the URL is redacted: {}",
+        "the account id the transport echoed is redacted: {}",
         errors[1].1
     );
     assert!(
@@ -817,6 +832,150 @@ fn errors_carry_no_credential_and_no_request_text() {
         assert_eq!(r.authorization, format!("Bearer {TOKEN}"));
         let body = String::from_utf8_lossy(&r.body);
         assert!(body.contains(TOPIC) && body.contains(AGENDA), "{body}");
+    }
+}
+
+/// The account id is a credential (ledger #171): it travels in the token
+/// request's FORM BODY, never in its request target, so a host transport that
+/// logs URLs sees no credential. Read off the wire by the stub: the target is the
+/// bare token path, the body is `application/x-www-form-urlencoded` carrying the
+/// grant type and the account id, and the client credentials ride only in the
+/// Basic header.
+#[test]
+fn the_account_id_travels_in_the_form_body_never_the_url() {
+    let stub = Stub::start();
+    let kernel = kernel(&stub, Arc::new(Secrets::default()), "/v2");
+    issue(&kernel, ID, &minimal(), &full_grant()).unwrap();
+    let token: Vec<Received> = stub
+        .received()
+        .into_iter()
+        .filter(|r| r.path.split('?').next() == Some(TOKEN_PATH))
+        .collect();
+    assert_eq!(token.len(), 1, "one token exchange");
+    let r = &token[0];
+    assert_eq!(r.path, TOKEN_PATH, "the request target carries no query");
+    for credential in [ACCOUNT_ID, CLIENT_ID, CLIENT_SECRET] {
+        assert!(
+            !r.path.contains(credential),
+            "a credential is in the URL: {}",
+            r.path
+        );
+    }
+    assert_eq!(r.content_type, "application/x-www-form-urlencoded");
+    let form: Vec<(String, String)> = url::form_urlencoded::parse(&r.body).into_owned().collect();
+    assert_eq!(
+        form,
+        [
+            ("grant_type".to_string(), "account_credentials".to_string()),
+            ("account_id".to_string(), ACCOUNT_ID.to_string()),
+        ],
+        "the form body"
+    );
+    assert_eq!(
+        r.authorization,
+        format!("Basic {}", base64(&format!("{CLIENT_ID}:{CLIENT_SECRET}")))
+    );
+    let body = String::from_utf8_lossy(&r.body);
+    assert!(
+        !body.contains(CLIENT_ID) && !body.contains(CLIENT_SECRET),
+        "the client credentials ride only in the Basic header: {body}"
+    );
+}
+
+/// The Turtle and JSON faces of one meeting state the same values as the same
+/// RDF TERMS (ledger #170), not merely the same text: every field the shareable
+/// graph carries is compared, as a parsed term, with the term its JSON value
+/// denotes under the predicate's range. `ik:passcode`'s range is read from the
+/// shared vocabulary itself, so a range change there turns this red instead of
+/// leaving the faces silently unequal (the `ik:batchAt` shape in ikigai-llm: a
+/// bare Turtle integer against `xsd:positiveInteger`). Topics with a quote, a
+/// backslash and line breaks are the escaping the Turtle face must survive.
+#[test]
+fn the_turtle_and_json_faces_are_term_equal() {
+    const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+    const XSD_DATETIME: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
+    const ICAL: &str = "http://www.w3.org/2002/12/cal/ical#";
+    let passcode = format!("{}passcode", ikigai_vocab::NS);
+    let vocabulary =
+        ikigai_conformance::rdf::parse("text/turtle", ikigai_vocab::VOCABULARY.as_bytes())
+            .expect("the shared vocabulary parses");
+    let passcode_range = vocabulary
+        .iter()
+        .find(|t| {
+            t.subject.to_string() == format!("<{passcode}>")
+                && t.predicate.as_str() == "http://www.w3.org/2000/01/rdf-schema#range"
+        })
+        .map(|t| match &t.object {
+            Term::NamedNode(range) => range.as_str().to_string(),
+            other => panic!("ik:passcode's range is not an IRI: {other}"),
+        })
+        .expect("the vocabulary states ik:passcode's range");
+
+    let stub = Stub::start();
+    let kernel = kernel(&stub, Arc::new(Secrets::default()), "/v2");
+    let root = Capability::root();
+    for topic in [
+        "Intro call",
+        r#"Say "hi" \ then go"#,
+        "line one\nline two\r\tend",
+    ] {
+        let face = |face: &str| {
+            let args = [
+                ("topic", topic),
+                ("start", "2026-01-01T00:00:00Z"),
+                ("as", face),
+            ];
+            issue(&kernel, ID, &args, &root)
+                .unwrap_or_else(|e| panic!("{topic:?} as={face}: {e}"))
+                .bytes
+        };
+        let turtle = face("text/turtle");
+        let json: serde_json::Value = serde_json::from_slice(&face("application/json")).unwrap();
+        assert_eq!(json["topic"], topic, "the JSON face carries the topic sent");
+        let triples = ikigai_conformance::rdf::parse("text/turtle", &turtle).unwrap_or_else(|e| {
+            panic!(
+                "{topic:?}: the Turtle face does not parse: {e}\n{}",
+                String::from_utf8_lossy(&turtle)
+            )
+        });
+        let field = |name: &str| {
+            json[name]
+                .as_str()
+                .unwrap_or_else(|| panic!("the JSON face has no string `{name}`: {json}"))
+        };
+        let subject = NamedNode::new(format!("urn:meeting:zoom:{}", field("id"))).unwrap();
+        let objects = |predicate: &str| -> Vec<Term> {
+            triples
+                .iter()
+                .filter(|t| {
+                    t.subject == subject.clone().into() && t.predicate.as_str() == predicate
+                })
+                .map(|t| t.object.clone())
+                .collect()
+        };
+        let typed = |name: &str, datatype: &str| {
+            vec![Term::from(Literal::new_typed_literal(
+                field(name),
+                NamedNode::new(datatype).unwrap(),
+            ))]
+        };
+        let iri = |name: &str| vec![Term::from(NamedNode::new(field(name)).unwrap())];
+        for (predicate, want) in [
+            (
+                "http://purl.org/dc/terms/identifier".to_string(),
+                typed("id", XSD_STRING),
+            ),
+            (
+                "https://schema.org/provider".to_string(),
+                typed("provider", XSD_STRING),
+            ),
+            (format!("{ICAL}summary"), typed("topic", XSD_STRING)),
+            (format!("{ICAL}conference"), iri("join_url")),
+            (passcode.clone(), typed("passcode", &passcode_range)),
+            (format!("{ICAL}dtstart"), typed("start_time", XSD_DATETIME)),
+        ] {
+            assert_eq!(objects(&predicate), want, "{topic:?}: <{predicate}>");
+        }
     }
 }
 
