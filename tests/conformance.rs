@@ -30,6 +30,14 @@
 //! - `space(transport, secrets, config)` is declared HOST-named
 //!   (`Suite::host_named_space`, SPACE-NAME): it is instance-built, so its doors
 //!   answer to whatever the host handed it, and it carries no name of its own.
+//! - `REQUIRED` holds the Sink too (`Suite::required_on_mutating`, ikigai-conformance
+//!   0.8.0). By default the check walks only `Source`/`Exists`, and this module has
+//!   neither, so without the opt-in it would be vacuous here. It is safe to turn on
+//!   because the kernel is a fixture: each drop of `topic` or `start` is one more call
+//!   of a mutating action, and the endpoint refuses it with a typed `MissingArgument`
+//!   before any secret is read or any socket opens, so the footprint [`conforms`]
+//!   pins is unchanged. This is the check the manifold test used to note no check
+//!   could make ("required but actually optional", PENDING #5/#49).
 //! - No opt-outs: every firing lands on the stub. No module namespace: the Turtle
 //!   face uses `ical:`, `dcterms:` and `schema:`, plus the one `ik:` term the shared
 //!   vocabulary defines for it, `ik:passcode` (`ikigai-vocab` 0.1.69). The walk is
@@ -62,8 +70,8 @@
 //!   named `agenda` wins.
 //! - **The manifold states the contract** ([`the_manifold_states_the_contract`]):
 //!   one Sink action, exactly the two capability families, every input classed,
-//!   only `topic` and `start` required (no check can see "required but actually
-//!   optional", PENDING #5/#49), and the entry's `name()` (`meeting`) is not the
+//!   only `topic` and `start` required (that each is really required is
+//!   `REQUIRED`'s, under [`conforms`]), and the entry's `name()` (`meeting`) is not the
 //!   description id — a fixture keyed on the name would be silently inert
 //!   (PENDING #57).
 
@@ -499,6 +507,9 @@ fn conforms() {
     let report = Suite::new()
         .checks(Checks::all() - Checks::NAMES)
         .host_named_space("ikigai_meeting::space(transport, secrets, config)", space)
+        // The one action is a Sink, so REQUIRED would walk nothing without this; every
+        // drop lands on the fixture and is refused before the stub or the keystore.
+        .required_on_mutating()
         .run_blocking(&kernel);
     // Printed even when clean (`--nocapture`): the report is the record.
     eprintln!("{report}");
@@ -521,10 +532,14 @@ fn conforms() {
     assert!(report.declared.pure.is_empty(), "{report}");
     assert!(report.declared.cacheable.is_empty(), "{report}");
     assert!(report.declared.namespaces.is_empty(), "{report}");
+    assert!(report.declared.required_on_mutating, "{report}");
+    assert!(report.declared.own.is_empty(), "{report}");
 
     // The footprint: per entry, ENFORCED under no grants reaches nothing (the
     // kernel's floor), the Turtle face fires once and PIPELINE fires once — two
     // meetings, each a token exchange and a create, each three secret reads.
+    // REQUIRED adds nothing: it measures against the PIPELINE firing, and each of
+    // its drops is refused before a secret is read or a socket opens.
     let firings = 2 * ENTRIES.len();
     assert_eq!(stub.hits(TOKEN_PATH), firings, "one token per firing");
     assert_eq!(stub.hits(MEETINGS_PATH), firings, "one meeting per firing");
