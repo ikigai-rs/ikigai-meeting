@@ -68,6 +68,11 @@
 //!   ([`content_is_the_agenda_when_piped`]): PIPELINE can only say `content` did
 //!   not raise `MissingArgument`; the stub says the bytes arrived, and that a
 //!   named `agenda` wins.
+//! - **The attendees reach Zoom, and both faces state them**
+//!   ([`attendees_reach_zoom_as_meeting_invitees`],
+//!   [`the_turtle_and_json_faces_are_term_equal`]): the stub reads them as
+//!   `settings.meeting_invitees`, and each is one `ical:attendee <mailto:…>` term
+//!   in the graph and one string in the envelope.
 //! - **The manifold states the contract** ([`the_manifold_states_the_contract`]):
 //!   one Sink action, exactly the two capability families, every input classed,
 //!   only `topic` and `start` required (that each is really required is
@@ -100,6 +105,9 @@ const CLIENT_SECRET: &str = "csec-SECRET-e1d0aa";
 const TOKEN: &str = "tok-SECRET-77af02";
 const TOPIC: &str = "Call with attendee@example.com";
 const AGENDA: &str = "PRIVATE-AGENDA-c3b1";
+/// Who the meeting is for (ledger #173), as the caller lists them, and each address.
+const ATTENDEES: &str = "pat@example.invalid, sam@example.invalid";
+const ATTENDEE_ADDRESSES: [&str; 2] = ["pat@example.invalid", "sam@example.invalid"];
 
 const SECRET_NAMES: [&str; 3] = ["zoom-account-id", "zoom-client-id", "zoom-client-secret"];
 
@@ -487,6 +495,7 @@ fn minimal() -> Vec<(&'static str, &'static str)> {
         ("topic", TOPIC),
         ("start", "2026-01-01T00:00:00Z"),
         ("agenda", AGENDA),
+        ("attendees", ATTENDEES),
     ]
 }
 
@@ -779,9 +788,22 @@ fn errors_carry_no_credential_and_no_request_text() {
             "bad duration",
             issue(&echo, ID, &bad("duration", "ninety minutes"), &root).unwrap_err(),
         ),
+        (
+            "bad attendees",
+            issue(
+                &echo,
+                ID,
+                &bad(
+                    "attendees",
+                    "pat@example.invalid, pat at example dot invalid",
+                ),
+                &root,
+            )
+            .unwrap_err(),
+        ),
     ];
     let basic = base64(&format!("{CLIENT_ID}:{CLIENT_SECRET}"));
-    let never: [&str; 9] = [
+    let never: [&str; 12] = [
         ACCOUNT_ID,
         CLIENT_ID,
         CLIENT_SECRET,
@@ -791,6 +813,9 @@ fn errors_carry_no_credential_and_no_request_text() {
         "attendee@example.com",
         AGENDA,
         "next tuesday",
+        ATTENDEE_ADDRESSES[0],
+        ATTENDEE_ADDRESSES[1],
+        "pat at example",
     ];
     for (case, err) in &errors {
         let rendered = format!("{err} / {err:?}");
@@ -834,6 +859,11 @@ fn errors_carry_no_credential_and_no_request_text() {
         matches!(errors[5].1, Error::InvalidArgument { ref name, .. } if name == "duration"),
         "{:?}",
         errors[5]
+    );
+    assert!(
+        matches!(errors[6].1, Error::InvalidArgument { ref name, .. } if name == "attendees"),
+        "{:?}",
+        errors[6]
     );
     // The echo routes really did receive the token and the request text — the
     // scrub is what kept them out.
@@ -938,6 +968,7 @@ fn the_turtle_and_json_faces_are_term_equal() {
             let args = [
                 ("topic", topic),
                 ("start", "2026-01-01T00:00:00Z"),
+                ("attendees", ATTENDEES),
                 ("as", face),
             ];
             issue(&kernel, ID, &args, &root)
@@ -991,7 +1022,53 @@ fn the_turtle_and_json_faces_are_term_equal() {
         ] {
             assert_eq!(objects(&predicate), want, "{topic:?}: <{predicate}>");
         }
+        // Each attendee: `ical:attendee <mailto:address>`, the address the JSON lists.
+        let mut listed: Vec<Term> = json["attendees"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the JSON face has no `attendees` list: {json}"))
+            .iter()
+            .map(|a| {
+                let address = a.as_str().expect("an attendee is a string");
+                Term::from(NamedNode::new(format!("mailto:{address}")).unwrap())
+            })
+            .collect();
+        let mut attendees = objects(&format!("{ICAL}attendee"));
+        listed.sort_by_key(Term::to_string);
+        attendees.sort_by_key(Term::to_string);
+        assert_eq!(listed.len(), ATTENDEE_ADDRESSES.len(), "{json}");
+        assert_eq!(attendees, listed, "{topic:?}: <{ICAL}attendee>");
     }
+}
+
+/// The attendees reach Zoom as its create-meeting `settings.meeting_invitees`, one
+/// `{"email": …}` per address in the order given, beside the settings the module always
+/// sends; with no attendees the field is absent (ledger #173).
+#[test]
+fn attendees_reach_zoom_as_meeting_invitees() {
+    let stub = Stub::start();
+    let kernel = kernel(&stub, Arc::new(Secrets::default()), "/v2");
+    let root = Capability::root();
+    let settings_sent = |args: &[(&str, &str)]| {
+        issue(&kernel, ID, args, &root).unwrap();
+        let last = stub.received().pop().unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&last.body).unwrap();
+        body["settings"].clone()
+    };
+    let settings = settings_sent(&minimal());
+    assert_eq!(
+        settings["meeting_invitees"],
+        serde_json::json!([
+            { "email": ATTENDEE_ADDRESSES[0] },
+            { "email": ATTENDEE_ADDRESSES[1] },
+        ]),
+        "{settings}"
+    );
+    assert_eq!(settings["join_before_host"], true, "{settings}");
+    let none = settings_sent(&[("topic", "t"), ("start", "2026-01-01T00:00:00Z")]);
+    assert!(
+        none.get("meeting_invitees").is_none(),
+        "no attendees, no field: {none}"
+    );
 }
 
 /// PIPELINE can only say `content` did not raise `MissingArgument`; the stub can
@@ -1061,6 +1138,11 @@ fn the_manifold_states_the_contract() {
         assert!(
             content.is_some_and(|c| !c.required),
             "{iri}: `content` is optional"
+        );
+        let attendees = spec.inputs.iter().find(|i| i.name == "attendees");
+        assert!(
+            attendees.is_some_and(|a| !a.required),
+            "{iri}: `attendees` is declared and optional"
         );
         let face = spec.inputs.iter().find(|i| i.name == "as").unwrap();
         assert_eq!(face.one_of, FACES, "{iri}");

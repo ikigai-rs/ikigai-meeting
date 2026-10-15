@@ -13,17 +13,19 @@ without re-plumbing at each destination.
 
 ## Faces
 
-`Sink urn:meeting:zoom:schedule topic=… start=… [duration=30] [timezone=…] [agenda=…] [as=…]`
+`Sink urn:meeting:zoom:schedule topic=… start=… [duration=30] [timezone=…] [attendees=…] [agenda=…] [as=…]`
 
 Every input is typed in the manifold (`topic` `xsd:string`, `start` `xsd:dateTime`, `duration`
 `xsd:integer`, …) and held to its type: a garbled value is a typed `InvalidArgument` that names
 the input and never echoes the value. A piped value — or a top-level `sink`'s body — arrives as
-`content` and is the **agenda** (a named `agenda` wins).
+`content` and is the **agenda** (a named `agenda` wins). `attendees` lists who the meeting is
+for, as email addresses separated by commas, semicolons or whitespace; Zoom receives them as the
+meeting's invitees.
 
 - default (`text/plain`) → the **join URL** (what an invite needs)
 - `as=text/turtle` → the **shareable graph** (join-safe: an `ical:Vevent` with `ical:conference`,
-  `dcterms:identifier`, `schema:provider`, the passcode — the host start URL is deliberately
-  withheld)
+  `dcterms:identifier`, `schema:provider`, the passcode, one `ical:attendee <mailto:…>` per
+  attendee — the host start URL is deliberately withheld)
 - `as=application/json` → the **full envelope** for the trusted caller, including the host
   `start_url` (which carries a start token)
 
@@ -34,6 +36,13 @@ Like ikigai-llm, no HTTP client and no keystore are baked in. The host injects:
 - an `ikigai_http::HttpTransport` (ureq/reqwest natively, `fetch` in the browser), and
 - a `SecretReader` — the host resolves `urn:secret:<name>` under a capability and hands the bytes
   in, so the Zoom credentials stay in the OS keystore and this crate never links it.
+
+## The token is cached
+
+The Server-to-Server token (about an hour) is kept in-process, keyed by account, and reused until
+a minute before its `expires_in`. Time is the kernel's clock: a host that installs none gets a
+fresh token on every call. A cached token Zoom refuses (`401`) is dropped and the call is tried
+once more with a fresh one.
 
 ## Capabilities
 
