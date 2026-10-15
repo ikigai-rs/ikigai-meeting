@@ -32,6 +32,18 @@
 //! otherwise name the account id, which rides in the token request's form body); an invalid input
 //! is named, never echoed.
 //!
+//! ## The token is cached, on the invocation's clock
+//!
+//! A Server-to-Server token lives about an hour (`expires_in`), so the backend keeps each one
+//! in-process, keyed by the token endpoint, the account id and the client id, and reuses it until
+//! [`TOKEN_REFRESH_MARGIN_SECS`] before it expires. Time is the invocation's ([`Invocation::now`]):
+//! a kernel with no clock has no time, and then every call mints a fresh token, which is the
+//! honest answer rather than a read of the wall clock behind the host's back. The cache can still
+//! be wrong about a token (a pinned corridor's clock, a revoked token), so a create-meeting `401`
+//! for a CACHED token drops it and tries once more with a fresh one; a `401` for a fresh token is
+//! the error it says it is. The credentials are still read, and the authority still checked, on
+//! every call: the cache saves only the token exchange.
+//!
 //! ## Field shapes
 //!
 //! The Zoom request/response field names below are per Zoom's stable create-meeting + S2S-token
@@ -46,7 +58,8 @@ use ikigai_core::{
 };
 use ikigai_http::{HttpRequest, HttpTransport, Method};
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// The net capability family the Sink declares: "holds some grant under `urn:cap:net:`". The
 /// module's own rule then requires the two Zoom hosts.
@@ -62,6 +75,10 @@ pub const FACES: [&str; 3] = ["text/plain", "text/turtle", "application/json"];
 
 /// The meeting length when `duration` is not given, in minutes.
 pub const DEFAULT_MINUTES: u32 = 30;
+
+/// How long before its stated expiry a cached token stops being used, in seconds. A token whose
+/// `expires_in` is no longer than this is used once and not cached.
+pub const TOKEN_REFRESH_MARGIN_SECS: u64 = 60;
 
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 const XSD_DATETIME: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
@@ -146,6 +163,7 @@ pub fn space(
         transport,
         secrets,
         config,
+        tokens: Arc::default(),
     };
     EndpointSpace::new()
         .bind(Exact::new("urn:meeting:zoom:schedule"), zoom.clone())
@@ -153,12 +171,14 @@ pub fn space(
 }
 
 /// The Zoom backend: exchange the S2S credentials for a bearer token, then create a scheduled
-/// meeting. Cloneable so the facade and the direct alias can share one configuration.
+/// meeting. Cloneable so the facade and the direct alias can share one configuration and one
+/// token cache.
 #[derive(Clone)]
 pub struct ZoomBackend {
     transport: Arc<dyn HttpTransport>,
     secrets: Arc<dyn SecretReader>,
     config: ZoomConfig,
+    tokens: Arc<TokenCache>,
 }
 
 /// One meeting as the caller asked for it — the validated inputs.
@@ -168,6 +188,85 @@ struct MeetingRequest {
     duration: u32,
     timezone: Option<String>,
     agenda: Option<String>,
+    attendees: Vec<String>,
+}
+
+/// Which token a cached entry is: the endpoint that minted it and the account and client it was
+/// minted for. The client secret is not part of it: a token minted before a rotation is still the
+/// account's token, and if Zoom refuses it the `401` path drops it.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct TokenKey {
+    token_url: String,
+    account_id: String,
+    client_id: String,
+}
+
+impl TokenKey {
+    fn of(token_url: &str, creds: &Credentials) -> TokenKey {
+        TokenKey {
+            token_url: token_url.to_string(),
+            account_id: creds.account_id.clone(),
+            client_id: creds.client_id.clone(),
+        }
+    }
+}
+
+/// A minted token and the instant (milliseconds, the invocation's clock) it stops being used.
+struct CachedToken {
+    token: String,
+    until_millis: u64,
+}
+
+/// The in-process token cache. Never `Debug`: it holds bearer tokens.
+#[derive(Default)]
+struct TokenCache(Mutex<HashMap<TokenKey, CachedToken>>);
+
+impl TokenCache {
+    /// The cached token for `key` if it is still in use at `now`; an expired entry is dropped.
+    fn get(&self, key: &TokenKey, now: u64) -> Option<String> {
+        let mut tokens = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match tokens.get(key) {
+            Some(cached) if now < cached.until_millis => Some(cached.token.clone()),
+            Some(_) => {
+                tokens.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Keep `token`, minted at `now` and valid for `expires_in` seconds, until
+    /// [`TOKEN_REFRESH_MARGIN_SECS`] before it expires. A lifetime no longer than the margin is
+    /// not kept.
+    fn put(&self, key: TokenKey, token: &str, now: u64, expires_in: u64) {
+        if expires_in <= TOKEN_REFRESH_MARGIN_SECS {
+            return;
+        }
+        let usable = expires_in - TOKEN_REFRESH_MARGIN_SECS;
+        let until_millis = now.saturating_add(usable.saturating_mul(1000));
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            key,
+            CachedToken {
+                token: token.to_string(),
+                until_millis,
+            },
+        );
+    }
+
+    /// Drop `key`'s entry if it still holds `token` (a concurrent call may have replaced it).
+    fn evict(&self, key: &TokenKey, token: &str) {
+        let mut tokens = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if tokens.get(key).is_some_and(|cached| cached.token == token) {
+            tokens.remove(key);
+        }
+    }
+}
+
+/// What a create-meeting call came back with: the meeting, or a `401` for a token the cache
+/// supplied, which the caller answers by minting a fresh one and trying once more.
+enum Created {
+    Meeting(Meeting),
+    TokenRefused,
 }
 
 /// The three S2S credentials, read from the keystore.
@@ -198,6 +297,15 @@ impl Endpoint for ZoomBackend {
             },
         };
         let timezone = optional(inv, "timezone");
+        let attendees = match optional(inv, "attendees") {
+            None => Vec::new(),
+            Some(list) => parse_attendees(&list).ok_or_else(|| {
+                invalid(
+                    "attendees",
+                    "not a list of email addresses (separated by commas, semicolons or whitespace)",
+                )
+            })?,
+        };
         // Pipeline citizenship: a named `agenda` wins; the piped `content` is the fallback.
         let agenda = optional(inv, "agenda").or_else(|| optional(inv, "content"));
         let face = optional(inv, "as").unwrap_or_else(|| FACES[0].to_string());
@@ -215,17 +323,40 @@ impl Endpoint for ZoomBackend {
 
         // Credentials the host resolved from the keystore.
         let creds = self.credentials()?;
-        let token = self.access_token(&token_url, &creds).await?;
         let request = MeetingRequest {
             topic,
             start,
             duration,
             timezone,
             agenda,
+            attendees,
         };
-        let meeting = self
-            .create_meeting(&meetings_url, &token, &creds, &request)
-            .await?;
+        // The token: a cached one while the invocation's clock says it is still good, else a
+        // fresh one (kept when there is a clock to judge it by).
+        let now = inv.now().map(|t| t.as_millis());
+        let key = TokenKey::of(&token_url, &creds);
+        let cached = now.and_then(|now| self.tokens.get(&key, now));
+        let meeting = match cached {
+            Some(token) => match self
+                .create_meeting(&meetings_url, &token, &creds, &request, true)
+                .await?
+            {
+                Created::Meeting(meeting) => meeting,
+                Created::TokenRefused => {
+                    self.tokens.evict(&key, &token);
+                    let token = self.fresh_token(&token_url, &creds, &key, now).await?;
+                    self.create_meeting(&meetings_url, &token, &creds, &request, false)
+                        .await?
+                        .into_meeting()?
+                }
+            },
+            None => {
+                let token = self.fresh_token(&token_url, &creds, &key, now).await?;
+                self.create_meeting(&meetings_url, &token, &creds, &request, false)
+                    .await?
+                    .into_meeting()?
+            }
+        };
 
         // Faces: default text/plain = the join URL (what the invite needs); `as=text/turtle` = the
         // SHAREABLE graph (join-safe, `ical:conference`); `as=application/json` = the full envelope
@@ -278,6 +409,15 @@ impl Endpoint for ZoomBackend {
             .input(
                 ArgSpec::new("timezone")
                     .summary("IANA zone the start time is in (e.g. America/Los_Angeles)")
+                    .class(XSD_STRING)
+                    .optional(),
+            )
+            .input(
+                ArgSpec::new("attendees")
+                    .summary(
+                        "who the meeting is for: email addresses, separated by commas, semicolons \
+                         or whitespace (Zoom's meeting invitees; ical:attendee in the graph)",
+                    )
                     .class(XSD_STRING)
                     .optional(),
             )
@@ -348,9 +488,12 @@ impl ZoomBackend {
     /// `grant_type=account_credentials&account_id=…` as an `application/x-www-form-urlencoded`
     /// body — RFC 6749 §4.4.2's client-credentials request. Zoom's own examples put those two
     /// parameters in the QUERY; the body keeps the account id (a credential) out of every URL a
-    /// host transport might log. (No caching in Slice 0 — a booking approval is rare; caching the
-    /// ~1h token is a later optimization.)
-    async fn access_token(&self, token_url: &str, creds: &Credentials) -> Result<String> {
+    /// host transport might log. Answers the token and its `expires_in` (seconds), when stated.
+    async fn access_token(
+        &self,
+        token_url: &str,
+        creds: &Credentials,
+    ) -> Result<(String, Option<u64>)> {
         let basic =
             base64_encode(format!("{}:{}", creds.client_id, creds.client_secret).as_bytes());
         let secrets = [
@@ -385,22 +528,48 @@ impl ZoomBackend {
         }
         let v: Value = serde_json::from_slice(&resp.body)
             .map_err(|_| Error::Endpoint("zoom oauth: response not JSON".to_string()))?;
-        v["access_token"]
+        let token = v["access_token"]
             .as_str()
             .map(str::to_string)
-            .ok_or_else(|| Error::Endpoint("zoom oauth: no access_token in response".to_string()))
+            .ok_or_else(|| {
+                Error::Endpoint("zoom oauth: no access_token in response".to_string())
+            })?;
+        // Zoom states `expires_in` as a number of seconds; accept a string too, defensively.
+        let expires_in = v["expires_in"]
+            .as_u64()
+            .or_else(|| v["expires_in"].as_str().and_then(|s| s.trim().parse().ok()));
+        Ok((token, expires_in))
+    }
+
+    /// A token minted now, kept in the cache when the invocation has a clock to judge it by.
+    async fn fresh_token(
+        &self,
+        token_url: &str,
+        creds: &Credentials,
+        key: &TokenKey,
+        now: Option<u64>,
+    ) -> Result<String> {
+        let (token, expires_in) = self.access_token(token_url, creds).await?;
+        if let (Some(now), Some(expires_in)) = (now, expires_in) {
+            self.tokens.put(key.clone(), &token, now, expires_in);
+        }
+        Ok(token)
     }
 
     /// Create a scheduled meeting. `POST {api_base}/users/{user_id}/meetings`, Bearer token.
-    /// Request fields per Zoom's create-meeting API (`type: 2` = scheduled); response fields
-    /// `id` / `join_url` / `start_url` / `password`.
+    /// Request fields per Zoom's create-meeting API (`type: 2` = scheduled; the attendees as
+    /// `settings.meeting_invitees`, a list of `{"email": …}`); response fields
+    /// `id` / `join_url` / `start_url` / `password`. A `401` for a token the cache supplied
+    /// (`cached`) is [`Created::TokenRefused`], not an error: nothing was created, so the caller
+    /// may mint a fresh token and try once more.
     async fn create_meeting(
         &self,
         url: &str,
         token: &str,
         creds: &Credentials,
         request: &MeetingRequest,
-    ) -> Result<Meeting> {
+        cached: bool,
+    ) -> Result<Created> {
         let secrets = [
             creds.account_id.as_str(),
             creds.client_id.as_str(),
@@ -420,6 +589,13 @@ impl ZoomBackend {
         if let Some(agenda) = &request.agenda {
             body["agenda"] = json!(agenda);
         }
+        if !request.attendees.is_empty() {
+            body["settings"]["meeting_invitees"] = request
+                .attendees
+                .iter()
+                .map(|email| json!({ "email": email }))
+                .collect();
+        }
         let resp = self
             .transport
             .send(HttpRequest {
@@ -438,6 +614,9 @@ impl ZoomBackend {
                     &secrets,
                 ))
             })?;
+        if resp.status == 401 && cached {
+            return Ok(Created::TokenRefused);
+        }
         if resp.status >= 400 {
             return Err(Error::Endpoint(scrub(
                 server_error("create-meeting", resp.status, &resp.body),
@@ -458,7 +637,7 @@ impl ZoomBackend {
                 "zoom create-meeting: no join_url in response".to_string(),
             ));
         }
-        Ok(Meeting {
+        Ok(Created::Meeting(Meeting {
             id,
             join_url,
             start_url: v["start_url"].as_str().unwrap_or("").to_string(),
@@ -469,8 +648,74 @@ impl ZoomBackend {
                 .unwrap_or(&request.start)
                 .to_string(),
             duration: request.duration,
-        })
+            attendees: request.attendees.clone(),
+        }))
     }
+}
+
+impl Created {
+    /// The meeting. Only a call made with a cached token can answer `TokenRefused`, so after a
+    /// fresh token it is the plain `401` it would otherwise have been.
+    fn into_meeting(self) -> Result<Meeting> {
+        match self {
+            Created::Meeting(meeting) => Ok(meeting),
+            Created::TokenRefused => Err(Error::Endpoint(
+                "zoom create-meeting returned 401".to_string(),
+            )),
+        }
+    }
+}
+
+/// The attendee list: addresses separated by commas, semicolons or whitespace (so a newline-
+/// separated list, the map convention, is one too). Each must be an address [`is_email`] accepts;
+/// a repeat (ignoring ASCII case) is dropped, keeping the first spelling. `None` when any item is
+/// not an address, or when nothing but separators was given.
+fn parse_attendees(list: &str) -> Option<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for item in list
+        .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+    {
+        if !is_email(item) {
+            return None;
+        }
+        if !out.iter().any(|seen| seen.eq_ignore_ascii_case(item)) {
+            out.push(item.to_string());
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// An email address this module will send and emit as a `mailto:` IRI unchanged: a dot-atom
+/// local part (at most 64 bytes) of ASCII letters, digits and `. _ - ~ ! $ ' * +` — the
+/// characters RFC 6068 lets a `mailto:` carry raw — then `@` and a domain of letter, digit and
+/// hyphen labels. Narrower than RFC 5322 on purpose: an address outside it would need
+/// percent-encoding, and then the graph's IRI and the JSON's string would no longer name the same
+/// address.
+fn is_email(s: &str) -> bool {
+    let Some((local, domain)) = s.split_once('@') else {
+        return false;
+    };
+    let local_ok = !local.is_empty()
+        && local.len() <= 64
+        && !local.starts_with('.')
+        && !local.ends_with('.')
+        && !local.contains("..")
+        && local
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-~!$'*+".contains(&b));
+    let domain_ok = !domain.is_empty()
+        && domain.len() <= 253
+        && domain.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+    local_ok && domain_ok
 }
 
 /// A required by-value input, or `MissingArgument` naming it.
@@ -594,6 +839,8 @@ struct Meeting {
     topic: String,
     start_time: String,
     duration: u32,
+    /// The addresses the meeting is for, as sent (already held to [`is_email`]).
+    attendees: Vec<String>,
 }
 
 impl Meeting {
@@ -606,7 +853,9 @@ impl Meeting {
     /// class, and that vocabulary declares domains only for its own classes): the code a
     /// participant types has no well-known home, because RFC 7986 carries a passcode only
     /// inside a conference URI and Zoom's `pwd=` is an encrypted token, not the code. It is
-    /// emitted as a string literal, never a number — leading zeros are significant.
+    /// emitted as a string literal, never a number — leading zeros are significant. Each attendee
+    /// is one `ical:attendee <mailto:address>` (RFC 5545's ATTENDEE, a CAL-ADDRESS), the same
+    /// address the JSON face lists under `attendees`.
     fn turtle(&self) -> Vec<u8> {
         let mut s = String::new();
         s.push_str("@prefix ik: <https://ikigai-rs.dev/ns#> .\n");
@@ -628,6 +877,12 @@ impl Meeting {
         if !self.passcode.is_empty() {
             s.push_str(&format!("    ik:passcode {} ;\n", ttl_str(&self.passcode)));
         }
+        for attendee in &self.attendees {
+            s.push_str(&format!(
+                "    ical:attendee {} ;\n",
+                ttl_iri(&format!("mailto:{attendee}"))
+            ));
+        }
         s.push_str(&format!(
             "    ical:dtstart {}^^xsd:dateTime .\n",
             ttl_str(&self.start_time)
@@ -646,6 +901,7 @@ impl Meeting {
             "topic": self.topic,
             "start_time": self.start_time,
             "duration": self.duration,
+            "attendees": self.attendees,
         }))
         .unwrap_or_default()
     }
@@ -980,6 +1236,69 @@ mod tests {
         ] {
             assert!(!is_xsd_datetime(bad), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn attendee_lists_split_on_commas_semicolons_and_whitespace_and_drop_repeats() {
+        assert_eq!(
+            parse_attendees("a@example.invalid, b@example.invalid;c@example.invalid\nd@example.invalid  e@example.invalid"),
+            Some(
+                [
+                    "a@example.invalid",
+                    "b@example.invalid",
+                    "c@example.invalid",
+                    "d@example.invalid",
+                    "e@example.invalid"
+                ]
+                .map(str::to_string)
+                .to_vec()
+            )
+        );
+        assert_eq!(
+            parse_attendees("Pat@Example.invalid,pat@example.INVALID, ,"),
+            Some(vec!["Pat@Example.invalid".to_string()]),
+            "a repeat in another case is the same address; empty items are separators"
+        );
+        assert_eq!(parse_attendees(" , ; "), None, "nothing but separators");
+        assert_eq!(
+            parse_attendees("a@example.invalid, not-an-address"),
+            None,
+            "one bad item refuses the list"
+        );
+    }
+
+    #[test]
+    fn is_email_accepts_what_a_mailto_carries_raw() {
+        for ok in [
+            "pat@example.invalid",
+            "pat.o'neil+zoom@mail.example.invalid",
+            "a_b-c~d!e$f*g@x-1.example.invalid",
+            "pat@localhost",
+        ] {
+            assert!(is_email(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "pat",
+            "@example.invalid",
+            "pat@",
+            "pat@@example.invalid",
+            "pat@example..invalid",
+            "pat@-example.invalid",
+            ".pat@example.invalid",
+            "pat.@example.invalid",
+            "pa..t@example.invalid",
+            "pat smith@example.invalid",
+            "pat%40@example.invalid",
+            "pat?cc=x@example.invalid",
+            "pat#x@example.invalid",
+            "<pat@example.invalid>",
+            "pat@example.invalid>",
+            "pat@exämple.invalid",
+        ] {
+            assert!(!is_email(bad), "{bad:?}");
+        }
+        assert!(!is_email(&format!("{}@example.invalid", "a".repeat(65))));
     }
 
     #[test]
