@@ -77,8 +77,14 @@ over the module's kernel against a loopback Zoom (the suite fires the Sink; noth
 real API), and pins by hand what the suite cannot see: the denial precedes every read and every
 socket, a schedule is never cached, every declared face is the face served, no error carries a
 credential or request text. One line remains in the report — `ik:passcode`, the term the shared
-vocabulary does not define yet. ⚠ The id `urn:meeting:zoom:schedule` is also a live MCP tool
-name, so renaming it is a breaking change for any agent already holding that tool.
+vocabulary does not define yet.
+
+## Naming
+
+Both IRIs reach one endpoint, whose description id and catalog label are one short noun:
+**`meeting`**. The id is what the MCP projection turns into an agent's tool name, so the tool an
+agent sees for this module is named from `meeting`. Before 0.2.0 the id was the full IRI
+`urn:meeting:zoom:schedule`; the IRIs themselves did not change (see `CHANGELOG.md`).
 
 ## Status
 

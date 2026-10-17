@@ -1,7 +1,7 @@
 //! The module recipe as one test: `ikigai-conformance` walks the two entries
-//! [`ikigai_meeting::space`] binds — one description, `urn:meeting:zoom:schedule`,
-//! reachable as itself and as the `urn:meeting:schedule` facade — and reports
-//! every violation at once.
+//! [`ikigai_meeting::space`] binds — one description, `meeting`, reachable as the
+//! Zoom backend's `urn:meeting:zoom:schedule` and as the `urn:meeting:schedule`
+//! facade — and reports every violation at once.
 //!
 //! ## The fixture kernel: a loopback Zoom, and a secret reader that counts
 //!
@@ -22,11 +22,10 @@
 //! - Nothing is `pure` and nothing is `cacheable`: a schedule is an effect, and
 //!   the suite's cache probe never runs on a Sink anyway. That it is live is
 //!   pinned by hand ([`a_schedule_is_never_cached`], conformance PENDING #22).
-//! - `NAMES` is dropped suite-wide, not opted out per id: the id
-//!   `urn:meeting:zoom:schedule` is a live MCP tool name, renamed in one
-//!   coordinated pass (wave two, `ikigai-core-PENDING.md` §1). `Suite::opt_out`
-//!   cannot carry this (it drops the invoking checks and leaves NAMES running), so
-//!   [`names_are_wave_two`] pins the one finding the pass will flip.
+//! - Every check runs, `NAMES` included: the id is `meeting`, a kebab-case noun,
+//!   and the catalog label `name()` is the same word. It was the full IRI
+//!   `urn:meeting:zoom:schedule` until the naming wave (ledger #11), which is why
+//!   [`the_id_is_a_kebab_case_noun`] pins NAMES on its own.
 //! - `space(transport, secrets, config)` is declared HOST-named
 //!   (`Suite::host_named_space`, SPACE-NAME): it is instance-built, so its doors
 //!   answer to whatever the host handed it, and it carries no name of its own.
@@ -76,9 +75,9 @@
 //! - **The manifold states the contract** ([`the_manifold_states_the_contract`]):
 //!   one Sink action, exactly the two capability families, every input classed,
 //!   only `topic` and `start` required (that each is really required is
-//!   `REQUIRED`'s, under [`conforms`]), and the entry's `name()` (`meeting`) is not the
-//!   description id — a fixture keyed on the name would be silently inert
-//!   (PENDING #57).
+//!   `REQUIRED`'s, under [`conforms`]), and the entry's `name()` is the description
+//!   id, `meeting` — before the naming wave they differed, and a fixture keyed on
+//!   the name was silently inert (PENDING #57).
 
 use async_trait::async_trait;
 use ikigai_conformance::{Check, Checks, Suite};
@@ -93,9 +92,11 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use url::Url;
 
-/// The one description id, and the two entries that reach it.
-const ID: &str = "urn:meeting:zoom:schedule";
-const ENTRIES: [&str; 2] = ["urn:meeting:zoom:schedule", "urn:meeting:schedule"];
+/// The one description id, the Zoom backend's own entry, and the two entries that
+/// reach the description.
+const ID: &str = "meeting";
+const ZOOM: &str = "urn:meeting:zoom:schedule";
+const ENTRIES: [&str; 2] = [ZOOM, "urn:meeting:schedule"];
 
 /// The credentials the reader answers, the token the stub mints, and request text
 /// none of which may appear in an error.
@@ -514,7 +515,6 @@ fn conforms() {
     ));
     let kernel = Kernel::new(space.clone());
     let report = Suite::new()
-        .checks(Checks::all() - Checks::NAMES)
         .host_named_space("ikigai_meeting::space(transport, secrets, config)", space)
         // The one action is a Sink, so REQUIRED would walk nothing without this; every
         // drop lands on the fixture and is refused before the stub or the keystore.
@@ -528,14 +528,14 @@ fn conforms() {
     // vocabulary as of `ikigai-vocab` 0.1.69.
     assert!(report.is_clean(), "{report}");
 
-    // One description, two entries, one Sink action each; only NAMES skipped;
+    // One description, two entries, one Sink action each; nothing skipped;
     // nothing declared.
     assert_eq!(report.endpoints, 1, "{report}");
     assert_eq!(report.actions, ENTRIES.len(), "{report}");
     assert_eq!(
         report.checks.skipped().collect::<Vec<_>>(),
-        vec![Check::Names],
-        "only NAMES is skipped: {report}"
+        Vec::<Check>::new(),
+        "every check runs: {report}"
     );
     assert!(report.declared.opted_out.is_empty(), "{report}");
     assert!(report.declared.pure.is_empty(), "{report}");
@@ -564,20 +564,17 @@ fn conforms() {
     }
 }
 
-/// The one finding the wave-two rename will flip: the id is an IRI, not a
-/// kebab-case noun — and nothing else under that check.
+/// The finding the naming wave (ledger #11) flipped: the id was the full IRI
+/// `urn:meeting:zoom:schedule`, and NAMES flagged it. Now it is `meeting`, a
+/// kebab-case noun, and NAMES alone finds nothing.
 #[test]
-fn names_are_wave_two() {
+fn the_id_is_a_kebab_case_noun() {
     let stub = Stub::start();
     let kernel = kernel(&stub, Arc::new(Secrets::default()), "/v2");
     let report = Suite::new().checks(Checks::NAMES).run_blocking(&kernel);
     eprintln!("{report}");
-    let flagged: Vec<&str> = report
-        .of(Check::Names)
-        .map(|f| f.endpoint.as_str())
-        .collect();
-    assert_eq!(flagged, [ID], "{report}");
-    assert_eq!(report.findings.len(), 1, "{report}");
+    assert_eq!(report.of(Check::Names).count(), 0, "{report}");
+    assert!(report.is_clean(), "{report}");
     assert_eq!(report.endpoints, 1, "{report}");
     assert_eq!(stub.connections(), 0, "NAMES is a static check");
 }
@@ -632,7 +629,7 @@ fn denied_before_any_secret_is_read_or_any_socket_opens() {
         "the gates precede the keystore: nothing read"
     );
 
-    let ok = issue(&kernel, ID, &minimal(), &full_grant()).unwrap();
+    let ok = issue(&kernel, ZOOM, &minimal(), &full_grant()).unwrap();
     assert_eq!(ok.repr_type.media_type, "text/plain");
     assert_eq!(ok.bytes, JOIN_URL.as_bytes());
     assert_eq!(secrets.reads(), 3, "each credential read once");
@@ -649,12 +646,12 @@ fn a_schedule_is_never_cached() {
     let kernel = kernel(&stub, Arc::new(Secrets::default()), "/v2");
     let root = Capability::root();
     for _ in 0..2 {
-        let repr = issue(&kernel, ID, &minimal(), &root).unwrap();
+        let repr = issue(&kernel, ZOOM, &minimal(), &root).unwrap();
         assert_eq!(repr.expiry, Expiry::Always, "a schedule is live");
         assert!(repr.threads().is_empty(), "an effect names no thread");
     }
     assert_eq!(stub.hits(MEETINGS_PATH), 2, "two resolutions, two meetings");
-    assert!(!kernel.is_cached(&request(ID, &minimal()), &root));
+    assert!(!kernel.is_cached(&request(ZOOM, &minimal()), &root));
 }
 
 fn declared_outputs(kernel: &Kernel, iri: &str) -> Vec<String> {
@@ -679,7 +676,7 @@ fn declared_outputs_are_the_media_types_served() {
     let stub = Stub::start();
     let kernel = kernel(&stub, Arc::new(Secrets::default()), "/v2");
     let root = Capability::root();
-    let declared = declared_outputs(&kernel, ID);
+    let declared = declared_outputs(&kernel, ZOOM);
     assert_eq!(declared, FACES, "{declared:?}");
     let mut served = Vec::new();
     for face in std::iter::once(None).chain(FACES.iter().map(Some)) {
@@ -687,7 +684,8 @@ fn declared_outputs_are_the_media_types_served() {
         if let Some(face) = face {
             args.push(("as", face));
         }
-        let repr = issue(&kernel, ID, &args, &root).unwrap_or_else(|e| panic!("as={face:?}: {e}"));
+        let repr =
+            issue(&kernel, ZOOM, &args, &root).unwrap_or_else(|e| panic!("as={face:?}: {e}"));
         let got = ikigai_conformance::rdf::bare_media_type(&repr.repr_type.media_type);
         assert!(
             declared.contains(&got),
@@ -726,7 +724,7 @@ fn declared_outputs_are_the_media_types_served() {
     let before = stub.connections();
     let mut args = minimal();
     args.push(("as", "text/html"));
-    let err = issue(&kernel, ID, &args, &root).unwrap_err();
+    let err = issue(&kernel, ZOOM, &args, &root).unwrap_err();
     assert!(
         matches!(err, Error::InvalidArgument { ref name, .. } if name == "as"),
         "{err:?}"
@@ -766,33 +764,33 @@ fn errors_carry_no_credential_and_no_request_text() {
     let errors: Vec<(&str, Error)> = vec![
         (
             "denied on the host",
-            issue(&echo, ID, &minimal(), &scoped(&other_host)).unwrap_err(),
+            issue(&echo, ZOOM, &minimal(), &scoped(&other_host)).unwrap_err(),
         ),
         (
             "transport failure naming the URL",
-            issue(&failing, ID, &minimal(), &root).unwrap_err(),
+            issue(&failing, ZOOM, &minimal(), &root).unwrap_err(),
         ),
         (
             "server 4xx echoing the request in JSON",
-            issue(&echo, ID, &minimal(), &root).unwrap_err(),
+            issue(&echo, ZOOM, &minimal(), &root).unwrap_err(),
         ),
         (
             "server 4xx echoing the request in text",
-            issue(&text, ID, &minimal(), &root).unwrap_err(),
+            issue(&text, ZOOM, &minimal(), &root).unwrap_err(),
         ),
         (
             "bad start",
-            issue(&echo, ID, &bad("start", "next tuesday at noon"), &root).unwrap_err(),
+            issue(&echo, ZOOM, &bad("start", "next tuesday at noon"), &root).unwrap_err(),
         ),
         (
             "bad duration",
-            issue(&echo, ID, &bad("duration", "ninety minutes"), &root).unwrap_err(),
+            issue(&echo, ZOOM, &bad("duration", "ninety minutes"), &root).unwrap_err(),
         ),
         (
             "bad attendees",
             issue(
                 &echo,
-                ID,
+                ZOOM,
                 &bad(
                     "attendees",
                     "pat@example.invalid, pat at example dot invalid",
@@ -890,7 +888,7 @@ fn errors_carry_no_credential_and_no_request_text() {
 fn the_account_id_travels_in_the_form_body_never_the_url() {
     let stub = Stub::start();
     let kernel = kernel(&stub, Arc::new(Secrets::default()), "/v2");
-    issue(&kernel, ID, &minimal(), &full_grant()).unwrap();
+    issue(&kernel, ZOOM, &minimal(), &full_grant()).unwrap();
     let token: Vec<Received> = stub
         .received()
         .into_iter()
@@ -971,7 +969,7 @@ fn the_turtle_and_json_faces_are_term_equal() {
                 ("attendees", ATTENDEES),
                 ("as", face),
             ];
-            issue(&kernel, ID, &args, &root)
+            issue(&kernel, ZOOM, &args, &root)
                 .unwrap_or_else(|e| panic!("{topic:?} as={face}: {e}"))
                 .bytes
         };
@@ -1049,7 +1047,7 @@ fn attendees_reach_zoom_as_meeting_invitees() {
     let kernel = kernel(&stub, Arc::new(Secrets::default()), "/v2");
     let root = Capability::root();
     let settings_sent = |args: &[(&str, &str)]| {
-        issue(&kernel, ID, args, &root).unwrap();
+        issue(&kernel, ZOOM, args, &root).unwrap();
         let last = stub.received().pop().unwrap();
         let body: serde_json::Value = serde_json::from_slice(&last.body).unwrap();
         body["settings"].clone()
@@ -1081,7 +1079,7 @@ fn content_is_the_agenda_when_piped() {
     let root = Capability::root();
     let base = [("topic", "t"), ("start", "2026-01-01T00:00:00Z")];
     let agenda_sent = |args: &[(&str, &str)]| {
-        issue(&kernel, ID, args, &root).unwrap();
+        issue(&kernel, ZOOM, args, &root).unwrap();
         let last = stub.received().pop().unwrap();
         let body: serde_json::Value = serde_json::from_slice(&last.body).unwrap();
         body["agenda"].as_str().map(str::to_string)
@@ -1103,7 +1101,7 @@ fn content_is_the_agenda_when_piped() {
 /// entries one description; exactly the two capability families; every input
 /// classed; only `topic` and `start` required; `content` declared and optional;
 /// `as` enumerates the faces with the join URL as its default. And the entry's
-/// `name()` is not the id.
+/// `name()` is the id.
 #[test]
 fn the_manifold_states_the_contract() {
     let stub = Stub::start();
@@ -1156,10 +1154,11 @@ fn the_manifold_states_the_contract() {
         .collect();
     assert_eq!(ours.len(), ENTRIES.len());
     for entry in ours {
-        // `name()` predates the id and differs from it: a conformance fixture keyed
-        // on `meeting` would match nothing (PENDING #57).
+        // `name()` and the id are one word since the naming wave (ledger #11):
+        // before it a conformance fixture keyed on `meeting` matched nothing
+        // (PENDING #57).
         assert_eq!(entry.endpoint, "meeting", "{}", entry.pattern);
-        assert_ne!(entry.endpoint, ID);
+        assert_eq!(entry.endpoint, ID, "{}", entry.pattern);
     }
     assert_eq!(SECRET_NAMES.len(), secret_grants().len());
 }

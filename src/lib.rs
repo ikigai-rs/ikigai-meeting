@@ -73,6 +73,10 @@ pub const CAP_SECRET_READ: &str = "urn:cap:secret:read:*";
 /// default.
 pub const FACES: [&str; 3] = ["text/plain", "text/turtle", "application/json"];
 
+/// The endpoint's one name: its description id (the MCP projection's tool name) and its catalog
+/// label. Both bound IRIs, `urn:meeting:schedule` and `urn:meeting:zoom:schedule`, reach it.
+const ID: &str = "meeting";
+
 /// The meeting length when `duration` is not given, in minutes.
 pub const DEFAULT_MINUTES: u32 = 30;
 
@@ -368,16 +372,16 @@ impl Endpoint for ZoomBackend {
         })
     }
 
-    // The catalog's short label, which predates the id and differs from it (`meeting` vs
-    // `urn:meeting:zoom:schedule`). The description id is the contract — selection, MCP and a
-    // conformance fixture all key on it. Renaming either is wave two (ikigai-core PENDING §1),
-    // one coordinated pass, because the id is a live MCP tool name.
+    // The catalog's short label and the description id are one name, `meeting`: a short noun in
+    // kebab-case (ikigai-core's naming conventions). Both bound IRIs reach this one endpoint, so
+    // the name is neither IRI. The id is the contract (selection and a conformance fixture key on
+    // it) and the MCP projection's tool name, so renaming it moves an agent's tool list.
     fn name(&self) -> &str {
-        "meeting"
+        ID
     }
 
     fn describe(&self) -> Description {
-        Description::new("urn:meeting:zoom:schedule")
+        Description::new(ID)
             .summary(
                 "Schedule a Zoom meeting. Returns the join URL (text), the shareable graph \
                  (as=text/turtle — ical:conference), or the full envelope (as=application/json, \
