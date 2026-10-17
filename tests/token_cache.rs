@@ -16,7 +16,8 @@ use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-const ID: &str = "urn:meeting:zoom:schedule";
+/// The Zoom backend's own entry, and the facade that reaches the same endpoint.
+const ZOOM: &str = "urn:meeting:zoom:schedule";
 const FACADE: &str = "urn:meeting:schedule";
 const T0: u64 = 1_700_000_000_000;
 
@@ -198,18 +199,18 @@ fn a_token_is_reused_until_the_margin_before_it_expires() {
     let clock = clock();
     let kernel = kernel(&zoom, &keystore, Some(&clock));
 
-    ok(&kernel, ID);
+    ok(&kernel, ZOOM);
     ok(&kernel, FACADE);
     let last_good = T0 + (3600 - TOKEN_REFRESH_MARGIN_SECS) * 1000 - 1;
     clock.set(last_good);
-    ok(&kernel, ID);
+    ok(&kernel, ZOOM);
     assert_eq!(zoom.minted(), 1, "one exchange for three schedules");
     assert_eq!(zoom.bearers(), ["tok-fake-1"; 3]);
     assert_eq!(keystore.reads(), 9, "three reads per call, cached or not");
 
     clock.set(last_good + 1);
-    ok(&kernel, ID);
-    ok(&kernel, ID);
+    ok(&kernel, ZOOM);
+    ok(&kernel, ZOOM);
     assert_eq!(
         zoom.minted(),
         2,
@@ -233,8 +234,8 @@ fn a_token_is_reused_until_the_margin_before_it_expires() {
 fn without_a_clock_every_call_mints() {
     let zoom = FakeZoom::new(json!(3600));
     let kernel = kernel(&zoom, &Keystore::new(), None);
-    ok(&kernel, ID);
-    ok(&kernel, ID);
+    ok(&kernel, ZOOM);
+    ok(&kernel, ZOOM);
     assert_eq!(zoom.minted(), 2);
     assert_eq!(zoom.bearers(), ["tok-fake-1", "tok-fake-2"]);
 }
@@ -246,11 +247,11 @@ fn tokens_are_keyed_by_account() {
     let zoom = FakeZoom::new(json!(3600));
     let keystore = Keystore::new();
     let kernel = kernel(&zoom, &keystore, Some(&clock()));
-    ok(&kernel, ID);
+    ok(&kernel, ZOOM);
     keystore.switch_account("acct-fake-2");
-    ok(&kernel, ID);
+    ok(&kernel, ZOOM);
     keystore.switch_account("acct-fake-1");
-    ok(&kernel, ID);
+    ok(&kernel, ZOOM);
     assert_eq!(zoom.minted(), 2, "one token per account");
     assert_eq!(zoom.bearers(), ["tok-fake-1", "tok-fake-2", "tok-fake-1"]);
 }
@@ -269,8 +270,8 @@ fn a_short_or_unstated_lifetime_is_not_cached() {
     ] {
         let zoom = FakeZoom::new(expires_in.clone());
         let kernel = kernel(&zoom, &Keystore::new(), Some(&clock()));
-        ok(&kernel, ID);
-        ok(&kernel, ID);
+        ok(&kernel, ZOOM);
+        ok(&kernel, ZOOM);
         assert_eq!(zoom.minted(), mints, "expires_in = {expires_in}");
     }
 }
@@ -281,10 +282,10 @@ fn a_short_or_unstated_lifetime_is_not_cached() {
 fn a_refused_cached_token_is_dropped_and_retried_once() {
     let zoom = FakeZoom::new(json!(3600));
     let kernel = kernel(&zoom, &Keystore::new(), Some(&clock()));
-    ok(&kernel, ID);
+    ok(&kernel, ZOOM);
     zoom.refuse("tok-fake-1");
-    ok(&kernel, ID);
-    ok(&kernel, ID);
+    ok(&kernel, ZOOM);
+    ok(&kernel, ZOOM);
     assert_eq!(zoom.minted(), 2);
     assert_eq!(
         zoom.bearers(),
@@ -294,7 +295,7 @@ fn a_refused_cached_token_is_dropped_and_retried_once() {
     // Refuse the cached token AND the next one minted: one retry, then the error.
     zoom.refuse("tok-fake-2");
     zoom.refuse("tok-fake-3");
-    let err = schedule(&kernel, ID, &Capability::root()).unwrap_err();
+    let err = schedule(&kernel, ZOOM, &Capability::root()).unwrap_err();
     assert!(matches!(err, Error::Endpoint(_)), "{err:?}");
     assert!(err.to_string().contains("401"), "{err}");
     assert!(!err.to_string().contains("tok-fake"), "{err}");
@@ -309,7 +310,7 @@ fn authority_is_checked_on_every_call_even_with_a_cached_token() {
     let zoom = FakeZoom::new(json!(3600));
     let keystore = Keystore::new();
     let kernel = kernel(&zoom, &keystore, Some(&clock()));
-    ok(&kernel, ID);
+    ok(&kernel, ZOOM);
     let reads = keystore.reads();
     let other_host = Capability::scoped(
         [
@@ -320,7 +321,7 @@ fn authority_is_checked_on_every_call_even_with_a_cached_token() {
         ]
         .map(str::to_string),
     );
-    let err = schedule(&kernel, ID, &other_host).unwrap_err();
+    let err = schedule(&kernel, ZOOM, &other_host).unwrap_err();
     assert!(matches!(err, Error::Denied(_)), "{err:?}");
     assert_eq!(zoom.bearers().len(), 1, "nothing sent under the refusal");
     assert_eq!(keystore.reads(), reads, "nothing read under the refusal");
