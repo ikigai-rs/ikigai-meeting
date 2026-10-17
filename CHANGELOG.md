@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
-### Changed (BREAKING: the next release is 0.3.0, not a patch)
+### Changed (BREAKING: a minor release, not a patch)
 
 - **ikigai-http 0.1.7 → 0.2.0** (the kebab-case rename, ledger #11). `ikigai_http::HttpTransport`
   is in this crate's public API: `space()` takes an `Arc<dyn HttpTransport>`. A host builds ONE
