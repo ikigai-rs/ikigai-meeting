@@ -11,15 +11,20 @@ keywords = ["ikigai", "roc", "meeting", "zoom", "calendar"]
 categories = ["web-programming"]
 
 [dependencies]
-# 0.1.47: the library's true minimum, checked by a fresh resolve at `=0.1.47` beside
-# `ikigai-http = "=0.1.7"` (whose own floor it is). The tests build newer: ikigai-conformance
-# 0.8 links 0.1.101+ (through its vocab pin), and the dev-dependency raises the resolve, not this floor.
-ikigai-core = "0.1.47"
+# 0.1.86: the floor `ikigai-http = "0.2.0"` sets (its own ikigai-core pin), checked by a fresh
+# resolve at `=0.1.86` beside `ikigai-http = "=0.2.0"`. This crate's own code needs only 0.1.47,
+# but no graph holding http 0.2 can resolve below 0.1.86, so a lower pin would state a floor
+# nothing can build. The tests build newer: ikigai-conformance 0.8 links 0.1.101+ (through its
+# vocab pin), and the dev-dependency raises the resolve, not this floor.
+ikigai-core = "0.1.86"
 # The HTTP I/O seam (HttpTransport) + wire types. The host injects one transport
 # (ureq/reqwest natively, fetch in the browser); no HTTP client or executor is baked in.
-# 0.1.7 is the true minimum: `net_allows_port` (the port-aware ACL the host gate uses, so a
-# port-scoped grant is enforced exactly) arrived there, with the bare-scope deny.
-ikigai-http = "0.1.7"
+# `HttpTransport` is in `space()`'s signature, so a host passes the SAME ikigai-http line it
+# serves `urn:http:*` from: this pin moves in step with the host's, and moving it is a breaking
+# (minor) release of this crate. 0.2.0 is the line with the kebab-case ids (ledger #11);
+# `net_allows_port` (the port-aware ACL, arrived in 0.1.7) is unchanged in it. A 0.x caret is a
+# CEILING too: "0.2.0" admits 0.2.x only.
+ikigai-http = "0.2.0"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

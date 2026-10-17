@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Changed (BREAKING: the next release is 0.3.0, not a patch)
+
+- **ikigai-http 0.1.7 → 0.2.0** (the kebab-case rename, ledger #11). `ikigai_http::HttpTransport`
+  is in this crate's public API: `space()` takes an `Arc<dyn HttpTransport>`. A host builds ONE
+  transport and hands it both to ikigai-http's `space()` (for `urn:http:get` and its siblings) and
+  to this one, so it must name the same ikigai-http line for both. A host on ikigai-http 0.2 cannot
+  pass its transport to a meeting built on 0.1, and a host still on 0.1 cannot pass its transport
+  to this one. That is a breaking change for consumers, so the release is a minor bump
+  (0.2.0 → 0.3.0), not a patch.
+- **ikigai-core floor 0.1.47 → 0.1.86.** This crate's own code still compiles against 0.1.47, but
+  ikigai-http 0.2.0 pins `ikigai-core = "0.1.86"`, so no graph holding it resolves lower. The new
+  floor is checked by a fresh resolve at `=0.1.86` beside `ikigai-http = "=0.2.0"`.
+- No old http names were in use here: this crate calls Zoom through the transport and never
+  resolves `urn:httpGet`-style IRIs or matches on the renamed ids.
+
 ## 0.2.0
 
 ### Renamed (BREAKING for anyone matching on ids or MCP tool names)

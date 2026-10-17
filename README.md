@@ -33,7 +33,8 @@ meeting's invitees.
 
 Like ikigai-llm, no HTTP client and no keystore are baked in. The host injects:
 
-- an `ikigai_http::HttpTransport` (ureq/reqwest natively, `fetch` in the browser), and
+- an `ikigai_http::HttpTransport` (ureq/reqwest natively, `fetch` in the browser) from the
+  ikigai-http 0.2 line, the same line the host serves `urn:http:*` from, and
 - a `SecretReader` — the host resolves `urn:secret:<name>` under a capability and hands the bytes
   in, so the Zoom credentials stay in the OS keystore and this crate never links it.
 
