@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 ### Renamed (BREAKING for anyone matching on ids or MCP tool names)
 
