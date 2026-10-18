@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.1
+
+### Changed
+
+- **The Zoom OAuth call builds its `Authorization: Basic` header with ikigai-http's shared
+  builder, `ikigai_http::auth::basic`** (ledger #1857), instead of a hand-rolled base64 encoder.
+  The private `base64_encode` and its RFC 4648 test are gone: the shared vectors in ikigai-http
+  (which the Python and Deno faces pin too) cover the encoding now. The header bytes for a valid
+  client id and secret are unchanged.
+- **A `client_id` containing `:` is now refused** (RFC 7617 §2: the first colon separates the user
+  id from the password, so such an id cannot be encoded). So is a control character in the client
+  id or secret. The refusal happens before any request is sent, and its text names the rule and
+  its stable code (`basic-user-id-colon`, `basic-user-id-control`, `basic-password-control`),
+  never the id or the secret. Before, such an id was encoded as given, and Zoom would have read
+  the wrong id.
+- **ikigai-http floor 0.2.0 → 0.2.1**, the release that carries `ikigai_http::auth`. Still the
+  0.2 line, so a host's transport passes through unchanged and this is a patch release.
+
 ## 0.3.0
 
 ### Changed (BREAKING: a minor release, not a patch)

@@ -498,13 +498,20 @@ impl ZoomBackend {
         token_url: &str,
         creds: &Credentials,
     ) -> Result<(String, Option<u64>)> {
-        let basic =
-            base64_encode(format!("{}:{}", creds.client_id, creds.client_secret).as_bytes());
+        // The shared RFC 7617 builder (ledger #1857). Its refusal names the broken rule and the
+        // stable code, never the client id or secret, so the error text is safe as it stands.
+        let auth =
+            ikigai_http::auth::basic(&creds.client_id, &creds.client_secret).map_err(|e| {
+                Error::Endpoint(format!(
+                    "zoom oauth: the client credentials cannot form a Basic header ({}): {e}",
+                    e.code()
+                ))
+            })?;
         let secrets = [
             creds.account_id.as_str(),
             creds.client_id.as_str(),
             creds.client_secret.as_str(),
-            basic.as_str(),
+            auth.credentials(),
         ];
         let resp = self
             .transport
@@ -512,7 +519,7 @@ impl ZoomBackend {
                 method: Method::Post,
                 url: token_url.to_string(),
                 headers: vec![
-                    ("Authorization".to_string(), format!("Basic {basic}")),
+                    ("Authorization".into(), auth.as_str().to_string()),
                     (
                         "Content-Type".to_string(),
                         "application/x-www-form-urlencoded".to_string(),
@@ -963,31 +970,6 @@ fn ttl_iri(iri: &str) -> String {
     out
 }
 
-/// Standard base64 with padding — just enough for the HTTP Basic header, so no dependency.
-fn base64_encode(input: &[u8]) -> String {
-    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(A[(n >> 18 & 63) as usize] as char);
-        out.push(A[(n >> 12 & 63) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            A[(n >> 6 & 63) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            A[(n & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1132,13 +1114,14 @@ mod tests {
             .iter()
             .find(|r| r.url.contains("/oauth/token"))
             .unwrap();
-        // Basic base64("cid-1:csec-1").
-        let want = format!("Basic {}", base64_encode(b"cid-1:csec-1"));
+        // Basic base64("cid-1:csec-1"), written out: the shared builder's own vectors pin the
+        // encoder, and this pins that the oauth call sends the client id and secret through it.
+        let want = "Basic Y2lkLTE6Y3NlYy0x";
         assert!(
             oauth
                 .headers
                 .iter()
-                .any(|(k, v)| k == "Authorization" && *v == want),
+                .any(|(k, v)| k == "Authorization" && v == want),
             "{:?}",
             oauth.headers
         );
@@ -1157,6 +1140,38 @@ mod tests {
         assert_eq!(sent["type"], 2);
         assert_eq!(sent["topic"], "t");
         assert_eq!(sent["duration"], DEFAULT_MINUTES);
+    }
+
+    #[test]
+    fn a_client_id_with_a_colon_is_refused_before_any_request_and_never_echoed() {
+        // RFC 7617 §2: the first colon separates user id from password, so a client id holding
+        // one cannot be encoded. The shared builder refuses it; nothing is sent, and the error
+        // names the rule, never the id or the secret.
+        struct ColonSecrets;
+        impl SecretReader for ColonSecrets {
+            fn read(&self, name: &str) -> Result<Vec<u8>> {
+                Ok(match name {
+                    "zoom-account-id" => b"acct-1".to_vec(),
+                    "zoom-client-id" => b"cid:colon".to_vec(),
+                    "zoom-client-secret" => b"csec-1".to_vec(),
+                    other => return Err(Error::Endpoint(format!("no secret {other}"))),
+                })
+            }
+        }
+        let transport = Arc::new(FakeZoom::default());
+        let k = Kernel::new(Arc::new(space(
+            Arc::clone(&transport) as Arc<dyn HttpTransport>,
+            Arc::new(ColonSecrets),
+            ZoomConfig::default(),
+        )));
+        let req = Request::new(Verb::Sink, Iri::parse("urn:meeting:zoom:schedule").unwrap())
+            .with_arg("topic", ArgRef::Inline(b"t".to_vec()))
+            .with_arg("start", ArgRef::Inline(b"2026-07-30T22:00:00Z".to_vec()));
+        let err = block_on(k.issue(req, &zoom_cap())).unwrap_err().to_string();
+        assert!(err.contains("basic-user-id-colon"), "{err}");
+        assert!(!err.contains("cid:colon"), "{err}");
+        assert!(!err.contains("csec-1"), "{err}");
+        assert!(transport.seen.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1371,24 +1386,5 @@ mod tests {
             ttl_iri("https://zoom.us/j/1?pwd=a b>c"),
             "<https://zoom.us/j/1?pwd=a%20b%3Ec>"
         );
-    }
-
-    #[test]
-    fn base64_encode_matches_rfc4648_vectors() {
-        // A self-consistent encoder passes the auth-header test yet could still be WRONG — the
-        // fake transport can't catch that. RFC 4648 §10's vectors exercise every padding case
-        // (0, 1, 2 `=`) and pin the encoder to correct, so the HTTP Basic header is real base64.
-        for (input, want) in [
-            ("", ""),
-            ("f", "Zg=="),
-            ("fo", "Zm8="),
-            ("foo", "Zm9v"),
-            ("foob", "Zm9vYg=="),
-            ("fooba", "Zm9vYmE="),
-            ("foobar", "Zm9vYmFy"),
-            ("hello", "aGVsbG8="),
-        ] {
-            assert_eq!(base64_encode(input.as_bytes()), want, "base64({input:?})");
-        }
     }
 }
