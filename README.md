@@ -34,7 +34,7 @@ meeting's invitees.
 Like ikigai-llm, no HTTP client and no keystore are baked in. The host injects:
 
 - an `ikigai_http::HttpTransport` (ureq/reqwest natively, `fetch` in the browser) from the
-  ikigai-http 0.2 line, the same line the host serves `urn:http:*` from, and
+  ikigai-http 0.3 line, the same line the host serves `urn:http:*` from, and
 - a `SecretReader` — the host resolves `urn:secret:<name>` under a capability and hands the bytes
   in, so the Zoom credentials stay in the OS keystore and this crate never links it.
 
@@ -57,6 +57,17 @@ before any socket opens**; the injected `SecretReader` is never asked.
 An error never carries a credential or the request's text: a server's 4xx contributes only its
 `message`, a transport's text is scrubbed of every credential value, an invalid input is named,
 not echoed.
+
+## How a schedule can fail
+
+Zoom's answers are typed by ikigai-http's one status table (`ikigai_http::status`), so they mean
+the same thing here as an origin's answer anywhere else in the ecosystem: a `401`/`403` is
+`Error::Refused` (Zoom refused the credential this module presented; `Denied` is only ever the
+capability floor's word), a `429` is `Error::RetryAfter` with the `Retry-After` delay, a `500` is
+`Error::Endpoint` (unknown), a `502`/`503` `Error::Unavailable` and a `408`/`504` `Error::Timeout`
+(transient), and a transport that got no answer is a `Timeout` or an `Unavailable`. The Sink
+declares those classes in its description, so the manifold says how it can fail before anyone
+calls it, and the conformance walk holds it to them.
 
 ## Zoom setup (one-time, host side)
 

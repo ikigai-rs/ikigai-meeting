@@ -11,21 +11,23 @@ keywords = ["ikigai", "roc", "meeting", "zoom", "calendar"]
 categories = ["web-programming"]
 
 [dependencies]
-# 0.1.86: the floor `ikigai-http = "0.2.0"` sets (its own ikigai-core pin), checked by a fresh
-# resolve at `=0.1.86` beside `ikigai-http = "=0.2.0"`. This crate's own code needs only 0.1.47,
-# but no graph holding http 0.2 can resolve below 0.1.86, so a lower pin would state a floor
-# nothing can build. The tests build newer: ikigai-conformance 0.8 links 0.1.101+ (through its
-# vocab pin), and the dev-dependency raises the resolve, not this floor.
-ikigai-core = "0.1.86"
+# 0.1.108: the release with the failure classes (`FailureClass`, `Error::class()`, the `Refused`,
+# `RetryAfter`, `OverBudget` and `Unsupported` variants, `Description::fails`; ledger #1546). This
+# crate's own code reads them: the Zoom actions declare the classes they can fail with, and the
+# errors the shared status table answers are those variants. It is also the floor
+# `ikigai-http = "0.3.0"` sets, so no graph holding http 0.3 resolves lower anyway.
+ikigai-core = "0.1.108"
 # The HTTP I/O seam (HttpTransport) + wire types. The host injects one transport
 # (ureq/reqwest natively, fetch in the browser); no HTTP client or executor is baked in.
 # `HttpTransport` is in `space()`'s signature, so a host passes the SAME ikigai-http line it
 # serves `urn:http:*` from: this pin moves in step with the host's, and moving it is a breaking
-# (minor) release of this crate. 0.2.0 is the line with the kebab-case ids (ledger #11);
-# `net_allows_port` (the port-aware ACL, arrived in 0.1.7) is unchanged in it. 0.2.1 is the floor
-# because the Zoom OAuth call builds its Basic header with `ikigai_http::auth::basic` (ledger
-# #1857), which arrived there. A 0.x caret is a CEILING too: "0.2.1" admits 0.2.x only.
-ikigai-http = "0.2.1"
+# (minor) release of this crate. 0.3.0 is the line with the ONE status table,
+# `ikigai_http::status` (ledger #1546): an origin's answer becomes the same typed error here as
+# in `urn:http:*` and ikigai-llm (401/403 `Refused`, 429 `RetryAfter`, 500 `Endpoint`, ...), and
+# a transport failure a `Timeout` or an `Unavailable`. `ikigai_http::auth::basic` (ledger #1857)
+# and `net_allows_port` (the port-aware ACL) are unchanged in it. A 0.x caret is a CEILING too:
+# "0.3.0" admits 0.3.x only.
+ikigai-http = "0.3.0"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -34,12 +36,16 @@ url = "2"
 
 [dev-dependencies]
 futures = "0.3"
-# The module recipe as one test (`tests/conformance.rs`). A 0.x caret is a CEILING
-# too: "0.8.0" admits 0.8.x only, so the next minor is a deliberate pin change.
-ikigai-conformance = "0.8.0"
+# The module recipe as one test (`tests/conformance.rs`). 0.10.0 carries the FAILURES check
+# (opt-in there through `Suite::check_failures`, the default from 0.11) and the `fails_under`
+# probes, which hold the Zoom action to the failure classes it declares (ledger #1546). A 0.x
+# caret is a CEILING too: "0.10.0" admits 0.10.x only, so the next minor is a deliberate pin
+# change.
+ikigai-conformance = "0.10.0"
 # The cross-face term-equality test (`tests/conformance.rs`): compares the Turtle face as
 # parsed RDF terms, and reads `ik:passcode`'s declared range from the shared vocabulary.
-# oxrdf 0.3 is the term model `ikigai_conformance::rdf::parse` returns; ikigai-vocab 0.1.69
-# is the first to define `ik:passcode`.
+# oxrdf 0.3 is the term model `ikigai_conformance::rdf::parse` returns; ikigai-vocab moves in
+# step with ikigai-core (0.1.108 is what conformance 0.10.0 pins); `ik:passcode` has been in it
+# since 0.1.69.
 oxrdf = "0.3"
-ikigai-vocab = "0.1.69"
+ikigai-vocab = "0.1.108"

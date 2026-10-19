@@ -9,7 +9,9 @@
 //! credential.
 
 use async_trait::async_trait;
-use ikigai_core::{ArgRef, Capability, Clock, Error, Iri, Kernel, Request, Time, Verb};
+use ikigai_core::{
+    ArgRef, Capability, Clock, Error, FailureClass, Iri, Kernel, Request, Time, Verb,
+};
 use ikigai_http::{HttpRequest, HttpResponse, HttpTransport};
 use ikigai_meeting::{SecretReader, ZoomConfig, TOKEN_REFRESH_MARGIN_SECS};
 use serde_json::{json, Value};
@@ -277,7 +279,9 @@ fn a_short_or_unstated_lifetime_is_not_cached() {
 }
 
 /// A create-meeting `401` for a CACHED token drops it and tries once more with a fresh one; the
-/// fresh one is then the cached one. A `401` for a fresh token is an error, with no further try.
+/// fresh one is then the cached one. A `401` for a fresh token is a typed `Refused` (ledger
+/// #1546: Zoom refused the credential this module presented; the class whose one retry, the
+/// credential holder's, was just spent), with no further try.
 #[test]
 fn a_refused_cached_token_is_dropped_and_retried_once() {
     let zoom = FakeZoom::new(json!(3600));
@@ -296,7 +300,8 @@ fn a_refused_cached_token_is_dropped_and_retried_once() {
     zoom.refuse("tok-fake-2");
     zoom.refuse("tok-fake-3");
     let err = schedule(&kernel, ZOOM, &Capability::root()).unwrap_err();
-    assert!(matches!(err, Error::Endpoint(_)), "{err:?}");
+    assert!(matches!(err, Error::Refused(_)), "{err:?}");
+    assert_eq!(err.class(), FailureClass::Refused);
     assert!(err.to_string().contains("401"), "{err}");
     assert!(!err.to_string().contains("tok-fake"), "{err}");
     assert_eq!(zoom.minted(), 3, "one fresh token, no loop");

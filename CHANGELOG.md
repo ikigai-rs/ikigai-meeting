@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased (0.4.0)
+
+### Changed (BREAKING: a minor release, not a patch)
+
+- **ikigai-http 0.2.1 → 0.3.0, ikigai-core 0.1.86 → 0.1.108** (ledger #1546, #1917).
+  `ikigai_http::HttpTransport` is in `space()`'s signature, so a host hands this crate a transport
+  from the ikigai-http 0.3 line, the same line it serves `urn:http:*` from; a host still on 0.2
+  cannot pass its transport to this release. That is the breaking change, and why this is a minor.
+- **Zoom's error answers are typed by ikigai-http's one status table** (`ikigai_http::status`)
+  instead of this crate's own `>= 400 → Endpoint` rule. What a caller sees, before → after:
+  - a `401`/`403` from the token endpoint or the create-meeting call: `Error::Endpoint` →
+    **`Error::Refused`** (class `refused`; display `refused: zoom oauth returned 401: …`). It
+    was never `Error::Denied` here: `Denied` stays the capability floor's word, for a caller whose
+    grant lacks a Zoom host or a credential name.
+  - a `429`: `Error::Endpoint` → **`Error::RetryAfter`**, carrying the `Retry-After` delay when the
+    header parses (delay-seconds, or an HTTP-date measured on the kernel's clock), so an HTTP edge
+    answers 429 with `Retry-After` and a budget-holding overlay can wait.
+  - a `502`, and a `503` without a usable `Retry-After`: `Error::Endpoint` →
+    **`Error::Unavailable`**; a `408`/`504`: → **`Error::Timeout`**. Both transient, so
+    ikigai-throttle's Retry, CircuitBreaker and Failover now engage in front of this module.
+  - a `503` with `Retry-After`: → **`Error::RetryAfter`**; a `413`/`414`/`431`: →
+    **`Error::OverBudget`**; a `404`/`410`: → **`Error::NotFound`**; a `409`/`412`: →
+    **`Error::Conflict`**; a `501`: → **`Error::Unsupported { verb: None, .. }`**.
+  - a `500`, every other 5xx and every other 4xx: `Error::Endpoint`, unchanged (class `unknown`:
+    an origin's 500 is no promise that a repeat helps).
+  - a transport that got no answer: `Error::Endpoint` → **`Error::Timeout`** when its words say it
+    timed out, **`Error::Unavailable`** otherwise (ikigai-http reads the words with the URL removed,
+    so a host named `timeout.example` cannot type its own refusals).
+  The detail text is unchanged in substance: this module's words, the body's `message` kept and
+  its echo dropped, every credential scrubbed. A `401` for a CACHED token still drops it and
+  tries once more with a fresh one; the second `401` is the `Refused` above, terminal.
+- **The Sink declares its failure classes** (`Description::fails`, core 0.1.108): `transient`,
+  `retry-after`, `over-budget`, `refused` and `unknown`, with `permanent` and (beside the two
+  `requires`) `denied` implied. The action's contract IRI changes with the declaration.
+- **ikigai-conformance 0.8.0 → 0.10.0** (dev-dependency): the walk opts into FAILURES
+  (`Suite::check_failures`) and two `fails_under` probes hold the Sink to `retry-after` under a
+  stub answering `429` and `refused` under one answering `401`.
+- **The conformance test's private base64 encoder is gone**: the Basic header it checks for is
+  built by `ikigai_http::auth::basic`, the shared RFC 7617 builder (ledger #1857).
+
 ## 0.3.1
 
 ### Changed
