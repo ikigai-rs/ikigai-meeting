@@ -37,6 +37,13 @@
 //!   before any secret is read or any socket opens, so the footprint [`conforms`]
 //!   pins is unchanged. This is the check the manifold test used to note no check
 //!   could make ("required but actually optional", PENDING #5/#49).
+//! - `FAILURES` runs (`Suite::check_failures`, ikigai-conformance 0.10.0, opt-in until
+//!   0.11): the Sink declares the failure classes it can produce (ledger #1546), and
+//!   every failure the walk observes is held to them. Two `fails_under` probes make
+//!   the stub answer what a walk cannot provoke: a topic of [`LIMITED_TOPIC`] is
+//!   answered `429` with `Retry-After: 30`, and must fail `retry-after`; a topic of
+//!   [`LOCKED_TOPIC`] is answered `401`, and must fail `refused`. Each probe fires
+//!   the Sink once (a token exchange and a create), which [`conforms`] counts.
 //! - No opt-outs: every firing lands on the stub. No module namespace: the Turtle
 //!   face uses `ical:`, `dcterms:` and `schema:`, plus the one `ik:` term the shared
 //!   vocabulary defines for it, `ik:passcode` (`ikigai-vocab` 0.1.69). The walk is
@@ -75,13 +82,16 @@
 //! - **The manifold states the contract** ([`the_manifold_states_the_contract`]):
 //!   one Sink action, exactly the two capability families, every input classed,
 //!   only `topic` and `start` required (that each is really required is
-//!   `REQUIRED`'s, under [`conforms`]), and the entry's `name()` is the description
+//!   `REQUIRED`'s, under [`conforms`]), the five failure classes the status table
+//!   and the transport can answer, and the entry's `name()` is the description
 //!   id, `meeting` — before the naming wave they differed, and a fixture keyed on
 //!   the name was silently inert (PENDING #57).
 
 use async_trait::async_trait;
-use ikigai_conformance::{Check, Checks, Suite};
-use ikigai_core::{ArgRef, Capability, Error, Expiry, Iri, Kernel, Representation, Request, Verb};
+use ikigai_conformance::{Check, Checks, Fixture, Suite};
+use ikigai_core::{
+    ArgRef, Capability, Error, Expiry, FailureClass, Iri, Kernel, Representation, Request, Verb,
+};
 use ikigai_http::{HttpRequest, HttpResponse, HttpTransport};
 use ikigai_meeting::{SecretReader, ZoomConfig, CAP_NET, CAP_SECRET_READ, FACES};
 use oxrdf::{Literal, NamedNode, Term};
@@ -109,6 +119,14 @@ const AGENDA: &str = "PRIVATE-AGENDA-c3b1";
 /// Who the meeting is for (ledger #173), as the caller lists them, and each address.
 const ATTENDEES: &str = "pat@example.invalid, sam@example.invalid";
 const ATTENDEE_ADDRESSES: [&str; 2] = ["pat@example.invalid", "sam@example.invalid"];
+
+/// The topics the stub keys its origin failures on, for the `fails_under` probes (ledger
+/// #1546): a meeting with [`LIMITED_TOPIC`] is answered `429` with `Retry-After: 30`, one
+/// with [`LOCKED_TOPIC`] `401`.
+const LIMITED_TOPIC: &str = "rate-limited topic";
+const LOCKED_TOPIC: &str = "locked topic";
+/// The delay the stub's `429` states, in seconds.
+const RETRY_AFTER_SECS: u64 = 30;
 
 const SECRET_NAMES: [&str; 3] = ["zoom-account-id", "zoom-client-id", "zoom-client-secret"];
 
@@ -226,21 +244,27 @@ impl Stub {
                     };
                     let authorization = header("authorization");
                     let content_type = header("content-type");
-                    let (status, reason, response_type, body_out) =
-                        respond(&method, &path, &authorization, &body);
+                    let reply = respond(&method, &path, &authorization, &body);
                     received.lock().unwrap().push(Received {
                         path,
                         authorization,
                         content_type,
                         body,
                     });
-                    let head = format!(
-                        "HTTP/1.1 {status} {reason}\r\nConnection: close\r\n\
-                         Content-Type: {response_type}\r\nContent-Length: {}\r\n\r\n",
-                        body_out.len()
+                    let mut head = format!(
+                        "HTTP/1.1 {} {}\r\nConnection: close\r\n\
+                         Content-Type: {}\r\nContent-Length: {}\r\n",
+                        reply.status,
+                        reply.reason,
+                        reply.content_type,
+                        reply.body.len()
                     );
+                    for (name, value) in &reply.headers {
+                        head.push_str(&format!("{name}: {value}\r\n"));
+                    }
+                    head.push_str("\r\n");
                     let _ = stream.write_all(head.as_bytes());
-                    let _ = stream.write_all(&body_out);
+                    let _ = stream.write_all(&reply.body);
                     let _ = stream.flush();
                 }
             })
@@ -287,19 +311,29 @@ impl Drop for Stub {
     }
 }
 
+/// One answer from the stub: the status line, the media type, extra headers and the body.
+struct Reply {
+    status: u16,
+    reason: &'static str,
+    content_type: &'static str,
+    headers: Vec<(&'static str, String)>,
+    body: Vec<u8>,
+}
+
 /// The stub's script. Under `/v2` the create-meeting route answers as Zoom does,
-/// echoing the request's `start_time`; under `/echo/v2` a 400 whose JSON body
-/// carries the request back (the `Authorization` header and the body) beside its
-/// `message`; under `/text/v2` a 400 whose plain-text body does the same;
-/// anything else a 404.
-fn respond(
-    method: &str,
-    path: &str,
-    authorization: &str,
-    request: &[u8],
-) -> (u16, &'static str, &'static str, Vec<u8>) {
-    let json =
-        |status, reason, body: String| (status, reason, "application/json", body.into_bytes());
+/// echoing the request's `start_time`, except for the two topics the `fails_under`
+/// probes send: [`LIMITED_TOPIC`] is answered `429` with `Retry-After`, and
+/// [`LOCKED_TOPIC`] `401`; under `/echo/v2` a 400 whose JSON body carries the
+/// request back (the `Authorization` header and the body) beside its `message`;
+/// under `/text/v2` a 400 whose plain-text body does the same; anything else a 404.
+fn respond(method: &str, path: &str, authorization: &str, request: &[u8]) -> Reply {
+    let json = |status, reason, body: String| Reply {
+        status,
+        reason,
+        content_type: "application/json",
+        headers: Vec::new(),
+        body: body.into_bytes(),
+    };
     let path = path.split('?').next().unwrap_or(path);
     match (method, path) {
         ("POST", TOKEN_PATH) => json(
@@ -308,17 +342,40 @@ fn respond(
             format!(r#"{{"access_token":"{TOKEN}","token_type":"bearer","expires_in":3600}}"#),
         ),
         ("POST", MEETINGS_PATH) => {
-            let start = serde_json::from_slice::<serde_json::Value>(request)
-                .ok()
-                .and_then(|v| v["start_time"].as_str().map(str::to_string))
-                .unwrap_or_else(|| "2026-01-01T00:00:00Z".to_string());
-            json(
-                200,
-                "OK",
-                format!(
-                    r#"{{"id":88899900011,"join_url":"{JOIN_URL}","start_url":"https://zoom.us/s/88899900011?zak=HOST-SECRET","password":"a1b2c3","start_time":"{start}"}}"#
+            let sent = serde_json::from_slice::<serde_json::Value>(request).ok();
+            let field = |name: &str| {
+                sent.as_ref()
+                    .and_then(|v| v[name].as_str().map(str::to_string))
+            };
+            match field("topic").as_deref() {
+                Some(LIMITED_TOPIC) => {
+                    let mut reply = json(
+                        429,
+                        "Too Many Requests",
+                        r#"{"code":429,"message":"too many requests"}"#.to_string(),
+                    );
+                    reply
+                        .headers
+                        .push(("Retry-After", RETRY_AFTER_SECS.to_string()));
+                    reply
+                }
+                Some(LOCKED_TOPIC) => json(
+                    401,
+                    "Unauthorized",
+                    r#"{"code":124,"message":"Invalid access token."}"#.to_string(),
                 ),
-            )
+                _ => {
+                    let start =
+                        field("start_time").unwrap_or_else(|| "2026-01-01T00:00:00Z".to_string());
+                    json(
+                        200,
+                        "OK",
+                        format!(
+                            r#"{{"id":88899900011,"join_url":"{JOIN_URL}","start_url":"https://zoom.us/s/88899900011?zak=HOST-SECRET","password":"a1b2c3","start_time":"{start}"}}"#
+                        ),
+                    )
+                }
+            }
         }
         ("POST", "/echo/v2/users/me/meetings") => json(
             400,
@@ -329,16 +386,17 @@ fn respond(
                 serde_json::Value::String(String::from_utf8_lossy(request).into_owned())
             ),
         ),
-        ("POST", "/text/v2/users/me/meetings") => (
-            400,
-            "Bad Request",
-            "text/plain",
-            format!(
+        ("POST", "/text/v2/users/me/meetings") => Reply {
+            status: 400,
+            reason: "Bad Request",
+            content_type: "text/plain",
+            headers: Vec::new(),
+            body: format!(
                 "refused: {authorization} {}",
                 String::from_utf8_lossy(request)
             )
             .into_bytes(),
-        ),
+        },
         _ => json(
             404,
             "Not Found",
@@ -519,6 +577,18 @@ fn conforms() {
         // The one action is a Sink, so REQUIRED would walk nothing without this; every
         // drop lands on the fixture and is refused before the stub or the keystore.
         .required_on_mutating()
+        // FAILURES (conformance 0.10.0, opt-in until 0.11): the Sink is held to the
+        // failure classes it declares (ledger #1546), and two probes provoke the two an
+        // origin answers that a walk cannot: the stub keys them on the topic.
+        .check_failures()
+        .fails_under(
+            Fixture::new(ID, Verb::Sink).arg("topic", LIMITED_TOPIC),
+            FailureClass::RetryAfter,
+        )
+        .fails_under(
+            Fixture::new(ID, Verb::Sink).arg("topic", LOCKED_TOPIC),
+            FailureClass::Refused,
+        )
         .run_blocking(&kernel);
     // Printed even when clean (`--nocapture`): the report is the record.
     eprintln!("{report}");
@@ -529,7 +599,7 @@ fn conforms() {
     assert!(report.is_clean(), "{report}");
 
     // One description, two entries, one Sink action each; nothing skipped;
-    // nothing declared.
+    // nothing declared but the two opt-ins and the probes.
     assert_eq!(report.endpoints, 1, "{report}");
     assert_eq!(report.actions, ENTRIES.len(), "{report}");
     assert_eq!(
@@ -542,14 +612,32 @@ fn conforms() {
     assert!(report.declared.cacheable.is_empty(), "{report}");
     assert!(report.declared.namespaces.is_empty(), "{report}");
     assert!(report.declared.required_on_mutating, "{report}");
+    assert!(report.declared.evidence.check_failures, "{report}");
     assert!(report.declared.own.is_empty(), "{report}");
+
+    // Every probe ran, and failed with exactly the class it states; every action the
+    // walk judged states its classes, so FAILURES compared each observation with a
+    // declaration rather than with nothing.
+    let probes = &report.declared.evidence.fails_under;
+    assert_eq!(probes.len(), PROBE_FIRINGS, "{report}");
+    for probe in probes {
+        assert_eq!(probe.endpoint, ID, "{report}");
+        assert_eq!(probe.got, Some(probe.expected), "{report}");
+    }
+    let seen = &report.declared.evidence.failures;
+    assert!(!seen.is_empty(), "{report}");
+    for action in seen {
+        assert!(action.declared.is_some(), "{report}");
+    }
 
     // The footprint: per entry, ENFORCED under no grants reaches nothing (the
     // kernel's floor), the Turtle face fires once and PIPELINE fires once — two
     // meetings, each a token exchange and a create, each three secret reads.
     // REQUIRED adds nothing: it measures against the PIPELINE firing, and each of
-    // its drops is refused before a secret is read or a socket opens.
-    let firings = 2 * ENTRIES.len();
+    // its drops is refused before a secret is read or a socket opens. Each
+    // `fails_under` probe fires the Sink once more: a token exchange and a create the
+    // stub refuses.
+    let firings = 2 * ENTRIES.len() + PROBE_FIRINGS;
     assert_eq!(stub.hits(TOKEN_PATH), firings, "one token per firing");
     assert_eq!(stub.hits(MEETINGS_PATH), firings, "one meeting per firing");
     assert_eq!(stub.connections(), 2 * firings);
@@ -563,6 +651,12 @@ fn conforms() {
         );
     }
 }
+
+/// How many times the two `fails_under` probes fire the Sink: once per probe PER ENTRY. Both
+/// probes name the one description id, and the suite lays each over every entry that reaches
+/// it (measured on conformance 0.10.0: four `fails under:` lines for two probes), so each
+/// probe is a token exchange and a refused create on each of the two IRIs.
+const PROBE_FIRINGS: usize = 2 * ENTRIES.len();
 
 /// The finding the naming wave (ledger #11) flipped: the id was the full IRI
 /// `urn:meeting:zoom:schedule`, and NAMES flagged it. Now it is `meeting`, a
@@ -800,13 +894,13 @@ fn errors_carry_no_credential_and_no_request_text() {
             .unwrap_err(),
         ),
     ];
-    let basic = base64(&format!("{CLIENT_ID}:{CLIENT_SECRET}"));
+    let basic = basic_header();
     let never: [&str; 12] = [
         ACCOUNT_ID,
         CLIENT_ID,
         CLIENT_SECRET,
         TOKEN,
-        &basic,
+        basic.credentials(),
         TOPIC,
         "attendee@example.com",
         AGENDA,
@@ -914,10 +1008,7 @@ fn the_account_id_travels_in_the_form_body_never_the_url() {
         ],
         "the form body"
     );
-    assert_eq!(
-        r.authorization,
-        format!("Basic {}", base64(&format!("{CLIENT_ID}:{CLIENT_SECRET}")))
-    );
+    assert_eq!(r.authorization, basic_header().as_str());
     let body = String::from_utf8_lossy(&r.body);
     assert!(
         !body.contains(CLIENT_ID) && !body.contains(CLIENT_SECRET),
@@ -1146,6 +1237,32 @@ fn the_manifold_states_the_contract() {
         assert_eq!(face.one_of, FACES, "{iri}");
         assert_eq!(face.default.as_deref(), Some(FACES[0]), "{iri}");
         assert_eq!(declared_outputs(&kernel, iri), FACES, "{iri}");
+        // How it can fail (ledger #1546): the status table's classes and the transport's,
+        // with `permanent` implied and `denied` implied by the two `requires`.
+        assert_eq!(
+            spec.failures.classes(),
+            Some(
+                [
+                    FailureClass::Transient,
+                    FailureClass::RetryAfter,
+                    FailureClass::OverBudget,
+                    FailureClass::Refused,
+                    FailureClass::Unknown,
+                ]
+                .as_slice()
+            ),
+            "{iri}: the declared failure classes"
+        );
+        assert_eq!(
+            spec.admits_failure(FailureClass::Denied),
+            Some(true),
+            "{iri}"
+        );
+        assert_eq!(
+            spec.admits_failure(FailureClass::Permanent),
+            Some(true),
+            "{iri}"
+        );
     }
     let entries = kernel.entries().expect("enumerable");
     let ours: Vec<_> = entries
@@ -1163,27 +1280,9 @@ fn the_manifold_states_the_contract() {
     assert_eq!(SECRET_NAMES.len(), secret_grants().len());
 }
 
-/// Standard base64, for the Basic header the error test must not find.
-fn base64(input: &str) -> String {
-    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let bytes = input.as_bytes();
-    let mut out = String::new();
-    for chunk in bytes.chunks(3) {
-        let n = (u32::from(chunk[0]) << 16)
-            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
-            | u32::from(*chunk.get(2).unwrap_or(&0));
-        out.push(A[(n >> 18 & 63) as usize] as char);
-        out.push(A[(n >> 12 & 63) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            A[(n >> 6 & 63) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            A[(n & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
+/// The Basic header the token request carries, built by the shared RFC 7617 builder
+/// (ikigai-http's `auth::basic`, ledger #1857) rather than a private encoder: what the
+/// stub must see, and what no error may carry.
+fn basic_header() -> ikigai_http::auth::Authorization {
+    ikigai_http::auth::basic(CLIENT_ID, CLIENT_SECRET).expect("the fake credentials encode")
 }

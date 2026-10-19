@@ -23,7 +23,7 @@
 //! [`Error::Denied`] issued before any secret is read and before any socket opens, and the
 //! injected [`SecretReader`] — which has no capability of its own — is never asked.
 //!
-//! ## What an error may say
+//! ## What an error may say, and what it IS
 //!
 //! An error travels through traces, logs and MCP replies, so nothing a credential or a caller
 //! put into the request comes back in one. A server's 4xx contributes only its `message` /
@@ -31,6 +31,17 @@
 //! scrubbed of every credential value (a transport that echoes the request it could not send would
 //! otherwise name the account id, which rides in the token request's form body); an invalid input
 //! is named, never echoed.
+//!
+//! Its TYPE is ikigai-http's one status table, [`ikigai_http::status`] (ledger #1546), the same
+//! table `urn:http:*` and ikigai-llm answer from, so a Zoom answer means the same thing here as an
+//! origin's answer anywhere else: a `401`/`403` is [`Error::Refused`] (Zoom refused the credential
+//! THIS module presented; the capability floor's [`Error::Denied`] is never Zoom's word), a `429`
+//! is [`Error::RetryAfter`] carrying the `Retry-After` delay when the header parses, a `500` is
+//! [`Error::Endpoint`] (unknown: no promise that a repeat helps), a `502`/`503` is
+//! [`Error::Unavailable`] and a `408`/`504` an [`Error::Timeout`] (transient), `413`/`414`/`431`
+//! [`Error::OverBudget`]; a transport that got no answer is a [`Error::Timeout`] when it timed out
+//! and an [`Error::Unavailable`] otherwise. The action DECLARES those classes
+//! (`Description::fails`), so the manifold says how a schedule can fail before anyone calls it.
 //!
 //! ## The token is cached, on the invocation's clock
 //!
@@ -41,8 +52,9 @@
 //! honest answer rather than a read of the wall clock behind the host's back. The cache can still
 //! be wrong about a token (a pinned corridor's clock, a revoked token), so a create-meeting `401`
 //! for a CACHED token drops it and tries once more with a fresh one; a `401` for a fresh token is
-//! the error it says it is. The credentials are still read, and the authority still checked, on
-//! every call: the cache saves only the token exchange.
+//! the [`Error::Refused`] it says it is, and terminal: the credential's holder renewed it once,
+//! which is the one retry the `refused` class allows. The credentials are still read, and the
+//! authority still checked, on every call: the cache saves only the token exchange.
 //!
 //! ## Field shapes
 //!
@@ -53,10 +65,11 @@
 
 use async_trait::async_trait;
 use ikigai_core::{
-    ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, Invocation, ReprType,
-    Representation, Result, Verb,
+    ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, FailureClass, Invocation,
+    ReprType, Representation, Result, Time, Verb,
 };
-use ikigai_http::{HttpRequest, HttpTransport, Method};
+use ikigai_http::status::{response_error, transport_error};
+use ikigai_http::{HttpRequest, HttpResponse, HttpTransport, Method};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -158,6 +171,61 @@ impl ZoomConfig {
 /// The meeting module. Binds `urn:meeting:schedule` (facade) and `urn:meeting:zoom:schedule`
 /// (backend). Slice 0 has one provider, so the facade delegates straight to Zoom; when more
 /// backends land it becomes a `provider=`/registry-default router (the `urn:llm:ask` shape).
+///
+/// What a caller sees when Zoom answers an error (ledger #1546): the variant, its class and its
+/// display are ikigai-http's one status table's, with this module's words as the detail and the
+/// body's `message` kept, the body's echo dropped. A `429` with `Retry-After: 30` and a `401`,
+/// through a fake transport:
+///
+/// ```
+/// use std::sync::Arc;
+/// use async_trait::async_trait;
+/// use ikigai_core::{ArgRef, Capability, Error, FailureClass, Iri, Kernel, Request, Verb};
+/// use ikigai_http::{HttpRequest, HttpResponse, HttpTransport};
+/// use ikigai_meeting::{SecretReader, ZoomConfig};
+///
+/// /// Zoom's token endpoint, answering one scripted status.
+/// struct Zoom(u16, Vec<(String, String)>, &'static str);
+/// #[async_trait]
+/// impl HttpTransport for Zoom {
+///     async fn send(&self, _: HttpRequest) -> Result<HttpResponse, String> {
+///         Ok(HttpResponse { status: self.0, headers: self.1.clone(), body: self.2.as_bytes().to_vec() })
+///     }
+/// }
+/// struct Secrets;
+/// impl SecretReader for Secrets {
+///     fn read(&self, _: &str) -> ikigai_core::Result<Vec<u8>> { Ok(b"fake".to_vec()) }
+/// }
+/// fn schedule(zoom: Zoom) -> Error {
+///     let kernel = Kernel::new(Arc::new(ikigai_meeting::space(
+///         Arc::new(zoom), Arc::new(Secrets), ZoomConfig::default(),
+///     )));
+///     let request = Request::new(Verb::Sink, Iri::parse("urn:meeting:schedule").unwrap())
+///         .with_arg("topic", ArgRef::Inline(b"Intro call".to_vec()))
+///         .with_arg("start", ArgRef::Inline(b"2026-07-30T22:00:00Z".to_vec()));
+///     futures::executor::block_on(kernel.issue(request, &Capability::root())).unwrap_err()
+/// }
+///
+/// let limited = schedule(Zoom(
+///     429,
+///     vec![("Retry-After".to_string(), "30".to_string())],
+///     r#"{"message":"too many requests"}"#,
+/// ));
+/// assert_eq!(limited.class(), FailureClass::RetryAfter);
+/// assert_eq!(limited.retry_after_millis(), Some(30_000));
+/// assert_eq!(
+///     limited.to_string(),
+///     "retry after 30000 ms: rate-limited: zoom oauth returned 429: too many requests"
+/// );
+///
+/// let refused = schedule(Zoom(401, vec![], r#"{"reason":"Invalid client_id or client_secret"}"#));
+/// assert!(matches!(refused, Error::Refused(_)));
+/// assert_eq!(refused.class(), FailureClass::Refused);
+/// assert_eq!(refused.to_string(), "refused: zoom oauth returned 401: Invalid client_id or client_secret");
+///
+/// // A 500 is `Endpoint` (unknown), the class that says a repeat promises nothing.
+/// assert_eq!(schedule(Zoom(500, vec![], "")).class(), FailureClass::Unknown);
+/// ```
 pub fn space(
     transport: Arc<dyn HttpTransport>,
     secrets: Arc<dyn SecretReader>,
@@ -336,27 +404,28 @@ impl Endpoint for ZoomBackend {
             attendees,
         };
         // The token: a cached one while the invocation's clock says it is still good, else a
-        // fresh one (kept when there is a clock to judge it by).
-        let now = inv.now().map(|t| t.as_millis());
+        // fresh one (kept when there is a clock to judge it by). The same clock measures a
+        // `Retry-After` given as an HTTP-date.
+        let now = inv.now();
         let key = TokenKey::of(&token_url, &creds);
-        let cached = now.and_then(|now| self.tokens.get(&key, now));
+        let cached = now.and_then(|now| self.tokens.get(&key, now.as_millis()));
         let meeting = match cached {
             Some(token) => match self
-                .create_meeting(&meetings_url, &token, &creds, &request, true)
+                .create_meeting(&meetings_url, &token, &creds, &request, true, now)
                 .await?
             {
                 Created::Meeting(meeting) => meeting,
                 Created::TokenRefused => {
                     self.tokens.evict(&key, &token);
                     let token = self.fresh_token(&token_url, &creds, &key, now).await?;
-                    self.create_meeting(&meetings_url, &token, &creds, &request, false)
+                    self.create_meeting(&meetings_url, &token, &creds, &request, false, now)
                         .await?
                         .into_meeting()?
                 }
             },
             None => {
                 let token = self.fresh_token(&token_url, &creds, &key, now).await?;
-                self.create_meeting(&meetings_url, &token, &creds, &request, false)
+                self.create_meeting(&meetings_url, &token, &creds, &request, false, now)
                     .await?
                     .into_meeting()?
             }
@@ -448,6 +517,15 @@ impl Endpoint for ZoomBackend {
             .output(FACES[0])
             .output(FACES[1])
             .output(FACES[2])
+            // How a schedule can fail (ledger #1546): every class ikigai-http's status table
+            // can answer for an origin's error, since both Zoom calls pass their answer through
+            // it, plus the transport's two transient failures. `permanent` (an invalid or
+            // missing input, a 404) and `denied` (beside the two `requires`) are implied.
+            .fails(FailureClass::Transient)
+            .fails(FailureClass::RetryAfter)
+            .fails(FailureClass::OverBudget)
+            .fails(FailureClass::Refused)
+            .fails(FailureClass::Unknown)
     }
 }
 
@@ -493,10 +571,13 @@ impl ZoomBackend {
     /// body — RFC 6749 §4.4.2's client-credentials request. Zoom's own examples put those two
     /// parameters in the QUERY; the body keeps the account id (a credential) out of every URL a
     /// host transport might log. Answers the token and its `expires_in` (seconds), when stated.
+    /// An error answer is typed by [`origin_error`] (so a `401` for the client credentials is
+    /// [`Error::Refused`]), a transport failure by [`no_answer`].
     async fn access_token(
         &self,
         token_url: &str,
         creds: &Credentials,
+        now: Option<Time>,
     ) -> Result<(String, Option<u64>)> {
         // The shared RFC 7617 builder (ledger #1857). Its refusal names the broken rule and the
         // stable code, never the client id or secret, so the error text is safe as it stands.
@@ -528,14 +609,9 @@ impl ZoomBackend {
                 body: token_form(&creds.account_id),
             })
             .await
-            .map_err(|e| {
-                Error::Endpoint(scrub(format!("zoom oauth transport error: {e}"), &secrets))
-            })?;
+            .map_err(|e| no_answer(&e, token_url, "oauth", &secrets))?;
         if resp.status >= 400 {
-            return Err(Error::Endpoint(scrub(
-                server_error("oauth", resp.status, &resp.body),
-                &secrets,
-            )));
+            return Err(origin_error(&resp, now, "oauth", &secrets));
         }
         let v: Value = serde_json::from_slice(&resp.body)
             .map_err(|_| Error::Endpoint("zoom oauth: response not JSON".to_string()))?;
@@ -558,11 +634,12 @@ impl ZoomBackend {
         token_url: &str,
         creds: &Credentials,
         key: &TokenKey,
-        now: Option<u64>,
+        now: Option<Time>,
     ) -> Result<String> {
-        let (token, expires_in) = self.access_token(token_url, creds).await?;
+        let (token, expires_in) = self.access_token(token_url, creds, now).await?;
         if let (Some(now), Some(expires_in)) = (now, expires_in) {
-            self.tokens.put(key.clone(), &token, now, expires_in);
+            self.tokens
+                .put(key.clone(), &token, now.as_millis(), expires_in);
         }
         Ok(token)
     }
@@ -572,7 +649,8 @@ impl ZoomBackend {
     /// `settings.meeting_invitees`, a list of `{"email": …}`); response fields
     /// `id` / `join_url` / `start_url` / `password`. A `401` for a token the cache supplied
     /// (`cached`) is [`Created::TokenRefused`], not an error: nothing was created, so the caller
-    /// may mint a fresh token and try once more.
+    /// may mint a fresh token and try once more. Every other error answer is typed by
+    /// [`origin_error`], a transport failure by [`no_answer`].
     async fn create_meeting(
         &self,
         url: &str,
@@ -580,6 +658,7 @@ impl ZoomBackend {
         creds: &Credentials,
         request: &MeetingRequest,
         cached: bool,
+        now: Option<Time>,
     ) -> Result<Created> {
         let secrets = [
             creds.account_id.as_str(),
@@ -619,20 +698,12 @@ impl ZoomBackend {
                 body: serde_json::to_vec(&body).unwrap_or_default(),
             })
             .await
-            .map_err(|e| {
-                Error::Endpoint(scrub(
-                    format!("zoom create-meeting transport error: {e}"),
-                    &secrets,
-                ))
-            })?;
+            .map_err(|e| no_answer(&e, url, "create-meeting", &secrets))?;
         if resp.status == 401 && cached {
             return Ok(Created::TokenRefused);
         }
         if resp.status >= 400 {
-            return Err(Error::Endpoint(scrub(
-                server_error("create-meeting", resp.status, &resp.body),
-                &secrets,
-            )));
+            return Err(origin_error(&resp, now, "create-meeting", &secrets));
         }
         let v: Value = serde_json::from_slice(&resp.body)
             .map_err(|_| Error::Endpoint("zoom create-meeting: response not JSON".to_string()))?;
@@ -666,15 +737,37 @@ impl ZoomBackend {
 
 impl Created {
     /// The meeting. Only a call made with a cached token can answer `TokenRefused`, so after a
-    /// fresh token it is the plain `401` it would otherwise have been.
+    /// fresh token it is the plain `401` it would otherwise have been: a [`Error::Refused`].
     fn into_meeting(self) -> Result<Meeting> {
         match self {
             Created::Meeting(meeting) => Ok(meeting),
-            Created::TokenRefused => Err(Error::Endpoint(
+            Created::TokenRefused => Err(Error::Refused(
                 "zoom create-meeting returned 401".to_string(),
             )),
         }
     }
+}
+
+/// An error ANSWER from Zoom, typed by ikigai-http's one status table
+/// ([`ikigai_http::status::response_error`], ledger #1546): the variant is the table's row for
+/// the status (`401`/`403` [`Error::Refused`], `429` [`Error::RetryAfter`] with the `Retry-After`
+/// delay measured on `now`, `500` [`Error::Endpoint`], ...), and the detail is this module's
+/// [`server_error`] text, scrubbed of every credential. `what` names the call (`oauth`,
+/// `create-meeting`). Only called for a status of 400 or more; a success handed in anyway is
+/// still reported as a failure, never a panic.
+fn origin_error(resp: &HttpResponse, now: Option<Time>, what: &str, secrets: &[&str]) -> Error {
+    let detail = scrub(server_error(what, resp.status, &resp.body), secrets);
+    response_error(resp, now, detail.clone()).unwrap_or(Error::Endpoint(detail))
+}
+
+/// A request that got NO answer: the host transport's failure, typed by
+/// [`ikigai_http::status::transport_error`] (a timeout is [`Error::Timeout`], anything else
+/// [`Error::Unavailable`], both transient), with the transport's words scrubbed of every
+/// credential as the detail. The URL is removed before the words are read, so a host whose name
+/// says "timeout" cannot type its own refusals.
+fn no_answer(error: &str, url: &str, what: &str, secrets: &[&str]) -> Error {
+    let detail = scrub(format!("zoom {what} transport error: {error}"), secrets);
+    transport_error(error, url, detail)
 }
 
 /// The attendee list: addresses separated by commas, semicolons or whitespace (so a newline-
@@ -1195,6 +1288,226 @@ mod tests {
             transport.seen.lock().unwrap().is_empty(),
             "reached the network without a net cap"
         );
+    }
+
+    /// One scripted answer: a status, its headers and a body.
+    type Answer = (u16, Vec<(String, String)>, &'static str);
+
+    /// A transport whose token endpoint answers one scripted reply (an [`Answer`], or a
+    /// transport failure), so each row of the shared status table can be provoked.
+    struct Scripted(std::result::Result<Answer, String>);
+
+    #[async_trait]
+    impl HttpTransport for Scripted {
+        async fn send(&self, _: HttpRequest) -> std::result::Result<HttpResponse, String> {
+            let (status, headers, body) = self.0.clone()?;
+            Ok(HttpResponse {
+                status,
+                headers,
+                body: body.as_bytes().to_vec(),
+            })
+        }
+    }
+
+    /// Schedule through `transport`, with a clock at `now_millis` when given, and hand back
+    /// the error.
+    fn fails_with(transport: Scripted, now_millis: Option<u64>) -> Error {
+        struct At(u64);
+        impl ikigai_core::Clock for At {
+            fn now(&self) -> ikigai_core::Time {
+                ikigai_core::Time::from_millis(self.0)
+            }
+        }
+        let mut k = Kernel::new(Arc::new(space(
+            Arc::new(transport),
+            Arc::new(FakeSecrets),
+            ZoomConfig::default(),
+        )));
+        if let Some(now) = now_millis {
+            k = k.with_clock(Arc::new(At(now)));
+        }
+        let req = Request::new(Verb::Sink, Iri::parse("urn:meeting:zoom:schedule").unwrap())
+            .with_arg("topic", ArgRef::Inline(b"t".to_vec()))
+            .with_arg("start", ArgRef::Inline(b"2026-07-30T22:00:00Z".to_vec()));
+        block_on(k.issue(req, &zoom_cap())).unwrap_err()
+    }
+
+    /// The classes the Sink declares, as the manifold states them.
+    fn declared() -> ikigai_core::ActionSpec {
+        let k = kernel(Arc::new(FakeZoom::default()));
+        let specs = k
+            .describe_pattern("urn:meeting:zoom:schedule")
+            .unwrap()
+            .action_specs();
+        assert_eq!(specs.len(), 1);
+        specs.into_iter().next().unwrap()
+    }
+
+    /// Zoom's error answers are typed by ikigai-http's one status table (ledger #1546), not by
+    /// a private `>= 400 -> Endpoint` rule: a `401`/`403` is `Refused` (the class whose one
+    /// retry is the credential holder's), a `429` is `RetryAfter` carrying the header's delay,
+    /// a `500` stays the opaque `Endpoint`, a `503` and a `502` are transient, a `413` is
+    /// `OverBudget`. The detail keeps this module's words and the body's message, scrubbed, and
+    /// the Sink's declaration admits every class seen.
+    #[test]
+    fn zoom_answers_are_typed_by_the_shared_status_table() {
+        let spec = declared();
+        let header = |name: &str, value: &str| vec![(name.to_string(), value.to_string())];
+        let message = r#"{"message":"account acct-1 said no"}"#;
+        // Each case: the answer, the class it must have, and how its display must begin.
+        let cases: Vec<(Answer, FailureClass, &str)> = vec![
+            (
+                (401, vec![], message),
+                FailureClass::Refused,
+                "refused: zoom oauth returned 401:",
+            ),
+            (
+                (403, vec![], message),
+                FailureClass::Refused,
+                "refused: zoom oauth returned 403:",
+            ),
+            (
+                (429, header("Retry-After", "30"), message),
+                FailureClass::RetryAfter,
+                "retry after 30000 ms: rate-limited: zoom oauth returned 429:",
+            ),
+            (
+                (429, vec![], message),
+                FailureClass::RetryAfter,
+                "retry later: rate-limited: zoom oauth returned 429:",
+            ),
+            (
+                (500, vec![], message),
+                FailureClass::Unknown,
+                "zoom oauth returned 500:",
+            ),
+            (
+                (502, vec![], message),
+                FailureClass::Transient,
+                "zoom oauth returned 502:",
+            ),
+            (
+                (503, vec![], message),
+                FailureClass::Transient,
+                "zoom oauth returned 503:",
+            ),
+            (
+                (503, header("Retry-After", "5"), message),
+                FailureClass::RetryAfter,
+                "retry after 5000 ms: zoom oauth returned 503:",
+            ),
+            (
+                (413, vec![], message),
+                FailureClass::OverBudget,
+                "zoom oauth returned 413:",
+            ),
+            (
+                (404, vec![], message),
+                FailureClass::Permanent,
+                "zoom oauth returned 404:",
+            ),
+        ];
+        for (answer, class, prefix) in cases {
+            let status = answer.0;
+            let err = fails_with(Scripted(Ok(answer)), None);
+            assert_eq!(err.class(), class, "{status}: {err:?}");
+            let text = err.to_string();
+            assert!(text.contains(prefix), "{status}: {text}");
+            assert!(
+                text.contains("account [redacted] said no"),
+                "{status}: the body's message is kept, the credential in it scrubbed: {text}"
+            );
+            assert_eq!(
+                spec.admits_failure(class),
+                Some(true),
+                "{status}: the manifold admits `{class:?}`"
+            );
+        }
+        let refused = fails_with(Scripted(Ok((401, vec![], message))), None);
+        assert!(matches!(refused, Error::Refused(_)), "{refused:?}");
+        assert!(
+            !matches!(refused, Error::Denied(_)),
+            "Denied is the floor's word"
+        );
+
+        // A `Retry-After` HTTP-date is measured on the invocation's clock: 90 s ahead of it.
+        let at = 1_445_412_480_000u64; // 2015-10-21T07:28:00Z
+        let dated = fails_with(
+            Scripted(Ok((
+                429,
+                header("Retry-After", "Wed, 21 Oct 2015 07:28:00 GMT"),
+                message,
+            ))),
+            Some(at - 90_000),
+        );
+        assert_eq!(dated.retry_after_millis(), Some(90_000), "{dated}");
+        // With no clock the date cannot be measured: a rate limit with no delay.
+        let undated = fails_with(
+            Scripted(Ok((
+                429,
+                header("Retry-After", "Wed, 21 Oct 2015 07:28:00 GMT"),
+                message,
+            ))),
+            None,
+        );
+        assert!(
+            matches!(undated, Error::RetryAfter { delay: None, .. }),
+            "{undated:?}"
+        );
+    }
+
+    /// A request that got no answer is transient (ledger #1546): a transport that timed out is
+    /// a `Timeout`, any other failure an `Unavailable`, so the reliability overlays engage in
+    /// front of this module. The transport's words are kept as the detail, scrubbed of every
+    /// credential (here the account id the form body carries). Both classes are declared.
+    #[test]
+    fn a_transport_failure_is_transient_and_its_text_scrubbed() {
+        let spec = declared();
+        let slow = fails_with(
+            Scripted(Err(
+                "operation timed out sending account_id=acct-1".to_string()
+            )),
+            None,
+        );
+        assert!(matches!(slow, Error::Timeout(_)), "{slow:?}");
+        let down = fails_with(
+            Scripted(Err("connection refused (account_id=acct-1)".to_string())),
+            None,
+        );
+        assert!(matches!(down, Error::Unavailable(_)), "{down:?}");
+        for err in [slow, down] {
+            assert_eq!(err.class(), FailureClass::Transient);
+            assert!(err.is_transient());
+            assert_eq!(spec.admits_failure(err.class()), Some(true));
+            let text = err.to_string();
+            assert!(text.contains("zoom oauth transport error"), "{text}");
+            assert!(
+                text.contains("[redacted]") && !text.contains("acct-1"),
+                "{text}"
+            );
+        }
+    }
+
+    /// The manifold states how a schedule can fail: the five classes the status table and the
+    /// transport can answer, with `permanent` and (beside the two `requires`) `denied` implied.
+    #[test]
+    fn the_sink_declares_its_failure_classes() {
+        let spec = declared();
+        assert_eq!(
+            spec.failures.classes(),
+            Some(
+                [
+                    FailureClass::Transient,
+                    FailureClass::RetryAfter,
+                    FailureClass::OverBudget,
+                    FailureClass::Refused,
+                    FailureClass::Unknown,
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(spec.admits_failure(FailureClass::Permanent), Some(true));
+        assert_eq!(spec.admits_failure(FailureClass::Denied), Some(true));
     }
 
     #[test]
