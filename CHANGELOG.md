@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (0.4.0)
+## 0.4.0
 
 ### Changed (BREAKING: a minor release, not a patch)
 
