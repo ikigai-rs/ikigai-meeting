@@ -37,8 +37,8 @@
 //!   before any secret is read or any socket opens, so the footprint [`conforms`]
 //!   pins is unchanged. This is the check the manifold test used to note no check
 //!   could make ("required but actually optional", PENDING #5/#49).
-//! - `FAILURES` runs (`Suite::check_failures`, ikigai-conformance 0.10.0, opt-in until
-//!   0.11): the Sink declares the failure classes it can produce (ledger #1546), and
+//! - `FAILURES` runs (by default since ikigai-conformance 0.11.0; `Suite::check_failures`,
+//!   its 0.10.0 opt-in, is kept as the declaration [`conforms`] asserts): the Sink declares the failure classes it can produce (ledger #1546), and
 //!   every failure the walk observes is held to them. Two `fails_under` probes make
 //!   the stub answer what a walk cannot provoke: a topic of [`LIMITED_TOPIC`] is
 //!   answered `429` with `Retry-After: 30`, and must fail `retry-after`; a topic of
@@ -46,7 +46,11 @@
 //!   the Sink once (a token exchange and a create), which [`conforms`] counts.
 //! - No opt-outs: every firing lands on the stub. No module namespace: the Turtle
 //!   face uses `ical:`, `dcterms:` and `schema:`, plus the one `ik:` term the shared
-//!   vocabulary defines for it, `ik:passcode` (`ikigai-vocab` 0.1.69). The walk is
+//!   vocabulary defines for it, `ik:passcode` (`ikigai-vocab` 0.1.69). `DATATYPES`
+//!   (on by default since ikigai-conformance 0.11.0) holds each literal to its
+//!   property's declared `rdfs:range`, and finds nothing: `ik:passcode`'s range is
+//!   `xsd:string`, which a plain quoted literal is, and the face's one other typed
+//!   literal, `ical:dtstart`, is tagged `^^xsd:dateTime`. The walk is
 //!   clean — [`conforms`] asserts exactly that, with no term carved out.
 //!
 //! ## What the suite cannot see, pinned by hand
@@ -447,7 +451,7 @@ impl HttpTransport for Client {
         Ok(HttpResponse {
             status,
             headers,
-            body,
+            body: body.into(),
         })
     }
 }
@@ -577,7 +581,8 @@ fn conforms() {
         // The one action is a Sink, so REQUIRED would walk nothing without this; every
         // drop lands on the fixture and is refused before the stub or the keystore.
         .required_on_mutating()
-        // FAILURES (conformance 0.10.0, opt-in until 0.11): the Sink is held to the
+        // FAILURES (the default since conformance 0.11.0; this 0.10.0 opt-in stays as the
+        // declaration asserted below): the Sink is held to the
         // failure classes it declares (ledger #1546), and two probes provoke the two an
         // origin answers that a walk cannot: the stub keys them on the topic.
         .check_failures()
@@ -654,7 +659,7 @@ fn conforms() {
 
 /// How many times the two `fails_under` probes fire the Sink: once per probe PER ENTRY. Both
 /// probes name the one description id, and the suite lays each over every entry that reaches
-/// it (measured on conformance 0.10.0: four `fails under:` lines for two probes), so each
+/// it (measured on conformance 0.10.0 and 0.11.0: four `fails under:` lines for two probes), so each
 /// probe is a token exchange and a refused create on each of the two IRIs.
 const PROBE_FIRINGS: usize = 2 * ENTRIES.len();
 

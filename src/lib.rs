@@ -69,7 +69,7 @@ use ikigai_core::{
     ReprType, Representation, Result, Time, Verb,
 };
 use ikigai_http::status::{response_error, transport_error};
-use ikigai_http::{HttpRequest, HttpResponse, HttpTransport, Method};
+use ikigai_http::{HttpBody, HttpRequest, HttpResponse, HttpTransport, Method};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -103,6 +103,12 @@ const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
 
 /// What a credential value becomes in any error text this module composes from foreign text.
 const REDACTED: &str = "[redacted]";
+
+/// The most of a Zoom answer this module reads: 1 MiB. ikigai-http 0.4 hands the body over
+/// unread (an [`HttpBody`] the host may stream), so the reader sets the bound. A token or a
+/// created meeting is a few hundred bytes of JSON; a body past this is answered
+/// [`Error::OverBudget`] (a class the Sink declares), never buffered whole.
+const MAX_ZOOM_BODY: usize = 1024 * 1024;
 
 /// A read-only secret resolver. The host resolves `urn:secret:<name>` under a capability and hands
 /// the bytes in — the same injection discipline the [`HttpTransport`] gets. Sync because a keystore
@@ -189,7 +195,7 @@ impl ZoomConfig {
 /// #[async_trait]
 /// impl HttpTransport for Zoom {
 ///     async fn send(&self, _: HttpRequest) -> Result<HttpResponse, String> {
-///         Ok(HttpResponse { status: self.0, headers: self.1.clone(), body: self.2.as_bytes().to_vec() })
+///         Ok(HttpResponse { status: self.0, headers: self.1.clone(), body: self.2.as_bytes().to_vec().into() })
 ///     }
 /// }
 /// struct Secrets;
@@ -611,9 +617,9 @@ impl ZoomBackend {
             .await
             .map_err(|e| no_answer(&e, token_url, "oauth", &secrets))?;
         if resp.status >= 400 {
-            return Err(origin_error(&resp, now, "oauth", &secrets));
+            return Err(origin_error(resp, now, "oauth", &secrets).await);
         }
-        let v: Value = serde_json::from_slice(&resp.body)
+        let v: Value = serde_json::from_slice(&read_body(resp.body, "oauth").await?)
             .map_err(|_| Error::Endpoint("zoom oauth: response not JSON".to_string()))?;
         let token = v["access_token"]
             .as_str()
@@ -703,9 +709,9 @@ impl ZoomBackend {
             return Ok(Created::TokenRefused);
         }
         if resp.status >= 400 {
-            return Err(origin_error(&resp, now, "create-meeting", &secrets));
+            return Err(origin_error(resp, now, "create-meeting", &secrets).await);
         }
-        let v: Value = serde_json::from_slice(&resp.body)
+        let v: Value = serde_json::from_slice(&read_body(resp.body, "create-meeting").await?)
             .map_err(|_| Error::Endpoint("zoom create-meeting: response not JSON".to_string()))?;
         // Zoom returns the meeting id as a NUMBER; accept a string too, defensively.
         let id = v["id"]
@@ -754,10 +760,33 @@ impl Created {
 /// delay measured on `now`, `500` [`Error::Endpoint`], ...), and the detail is this module's
 /// [`server_error`] text, scrubbed of every credential. `what` names the call (`oauth`,
 /// `create-meeting`). Only called for a status of 400 or more; a success handed in anyway is
-/// still reported as a failure, never a panic.
-fn origin_error(resp: &HttpResponse, now: Option<Time>, what: &str, secrets: &[&str]) -> Error {
-    let detail = scrub(server_error(what, resp.status, &resp.body), secrets);
-    response_error(resp, now, detail.clone()).unwrap_or(Error::Endpoint(detail))
+/// still reported as a failure, never a panic. The body is read within [`MAX_ZOOM_BODY`]; one
+/// that cannot be read (too long, or the transport failed mid-body) only loses the server's
+/// `message`, never the status's row in the table.
+async fn origin_error(
+    mut resp: HttpResponse,
+    now: Option<Time>,
+    what: &str,
+    secrets: &[&str],
+) -> Error {
+    let body = std::mem::take(&mut resp.body)
+        .collect(MAX_ZOOM_BODY)
+        .await
+        .ok();
+    let detail = scrub(server_error(what, resp.status, body.as_deref()), secrets);
+    response_error(&resp, now, detail.clone()).unwrap_or(Error::Endpoint(detail))
+}
+
+/// A success answer's body, read within [`MAX_ZOOM_BODY`]. Past the bound it is
+/// [`Error::OverBudget`] naming the call; a transport that fails mid-body is ikigai-http's
+/// [`Error::Timeout`] or [`Error::Unavailable`], as for one that never answered.
+async fn read_body(body: HttpBody, what: &str) -> Result<Vec<u8>> {
+    body.collect(MAX_ZOOM_BODY).await.map_err(|e| match e {
+        Error::OverBudget { .. } => Error::OverBudget {
+            detail: format!("zoom {what}: response body exceeds {MAX_ZOOM_BODY} bytes"),
+        },
+        other => other,
+    })
 }
 
 /// A request that got NO answer: the host transport's failure, typed by
@@ -867,8 +896,11 @@ fn gate_net(inv: &Invocation<'_>, url: &str) -> Result<()> {
 
 /// What a server's error response contributes to an error: its status and, when the body is
 /// JSON, its `message` / `reason` / `error` string — never the body itself, which a server may
-/// fill with the request it refused (headers included).
-fn server_error(what: &str, status: u16, body: &[u8]) -> String {
+/// fill with the request it refused (headers included). `None` is a body that could not be read.
+fn server_error(what: &str, status: u16, body: Option<&[u8]>) -> String {
+    let Some(body) = body else {
+        return format!("zoom {what} returned {status} (body unreadable)");
+    };
     let detail = serde_json::from_slice::<Value>(body).ok().and_then(|v| {
         ["message", "reason", "error"]
             .iter()
@@ -1092,7 +1124,7 @@ mod tests {
             Ok(HttpResponse {
                 status: 200,
                 headers: vec![],
-                body: body.as_bytes().to_vec(),
+                body: body.as_bytes().to_vec().into(),
             })
         }
     }
@@ -1304,7 +1336,7 @@ mod tests {
             Ok(HttpResponse {
                 status,
                 headers,
-                body: body.as_bytes().to_vec(),
+                body: body.as_bytes().to_vec().into(),
             })
         }
     }
@@ -1453,6 +1485,71 @@ mod tests {
         assert!(
             matches!(undated, Error::RetryAfter { delay: None, .. }),
             "{undated:?}"
+        );
+    }
+
+    /// A transport that streams every answer (ikigai-http 0.4's `HttpBody::from_reader`), the
+    /// way a host adapter hands over a body it has not read: `status` and `body` for the token
+    /// endpoint, FakeZoom's meeting for the create call.
+    struct Streamed(u16, Vec<u8>);
+
+    #[async_trait]
+    impl HttpTransport for Streamed {
+        async fn send(&self, request: HttpRequest) -> std::result::Result<HttpResponse, String> {
+            let (status, body) = if request.url.contains("/oauth/token") {
+                (self.0, self.1.clone())
+            } else {
+                (
+                    200,
+                    br#"{"id":1,"join_url":"https://zoom.us/j/1"}"#.to_vec(),
+                )
+            };
+            Ok(HttpResponse {
+                status,
+                headers: vec![],
+                body: HttpBody::from_reader(futures::io::Cursor::new(body)),
+            })
+        }
+    }
+
+    /// A Zoom answer is read within `MAX_ZOOM_BODY` (ikigai-http 0.4 hands the body over
+    /// unread): a streamed answer is read whole; a success body past the bound is `OverBudget`
+    /// (a declared class) rather than buffered; an error body past it loses only the server's
+    /// message, never the status's row in the table.
+    #[test]
+    fn a_zoom_body_is_read_within_its_bound() {
+        let spec = declared();
+        let run = |transport: Streamed| {
+            let k = Kernel::new(Arc::new(space(
+                Arc::new(transport),
+                Arc::new(FakeSecrets),
+                ZoomConfig::default(),
+            )));
+            let req = Request::new(Verb::Sink, Iri::parse("urn:meeting:zoom:schedule").unwrap())
+                .with_arg("topic", ArgRef::Inline(b"t".to_vec()))
+                .with_arg("start", ArgRef::Inline(b"2026-07-30T22:00:00Z".to_vec()));
+            block_on(k.issue(req, &zoom_cap())).map(|r| String::from_utf8(r.bytes).unwrap())
+        };
+        let token = br#"{"access_token":"tok","expires_in":3600}"#.to_vec();
+        assert_eq!(run(Streamed(200, token)).unwrap(), "https://zoom.us/j/1");
+
+        let mut long = br#"{"access_token":"tok","pad":""#.to_vec();
+        long.resize(MAX_ZOOM_BODY + 1, b' ');
+        let err = run(Streamed(200, long.clone())).unwrap_err();
+        assert!(matches!(err, Error::OverBudget { .. }), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("zoom oauth: response body exceeds"),
+            "{err}"
+        );
+        assert_eq!(spec.admits_failure(err.class()), Some(true));
+
+        let err = run(Streamed(401, long)).unwrap_err();
+        assert!(matches!(err, Error::Refused(_)), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("zoom oauth returned 401 (body unreadable)"),
+            "{err}"
         );
     }
 
@@ -1647,20 +1744,26 @@ mod tests {
     fn a_server_error_contributes_only_its_message() {
         let echo = br#"{"code":300,"message":"bad request","echo":{"authorization":"Bearer tok"}}"#;
         assert_eq!(
-            server_error("create-meeting", 400, echo),
+            server_error("create-meeting", 400, Some(echo)),
             "zoom create-meeting returned 400: bad request"
         );
         assert_eq!(
             server_error(
                 "oauth",
                 401,
-                br#"{"reason":"Invalid client_id or client_secret","error":"invalid_client"}"#
+                Some(
+                    br#"{"reason":"Invalid client_id or client_secret","error":"invalid_client"}"#
+                )
             ),
             "zoom oauth returned 401: Invalid client_id or client_secret"
         );
         assert_eq!(
-            server_error("oauth", 502, b"<html>Bearer tok</html>"),
+            server_error("oauth", 502, Some(b"<html>Bearer tok</html>")),
             "zoom oauth returned 502 (23 bytes, not JSON)"
+        );
+        assert_eq!(
+            server_error("oauth", 503, None),
+            "zoom oauth returned 503 (body unreadable)"
         );
     }
 
