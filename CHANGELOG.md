@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.5.0
+
+### Changed (BREAKING: a minor release, not a patch)
+
+- **ikigai-core 0.1.108 → 0.2.0, ikigai-http 0.3.0 → 0.4.0** (the core 0.2.0 sweep, ledger
+  #2261). Core 0.2.0 is the streams release; the old `"0.1.108"` pin meant `<0.2.0` under 0.x
+  rules. Core's types and `ikigai_http::HttpTransport` are in `space()`'s signature, so a host
+  hands this crate a transport from the ikigai-http 0.4 line on core 0.2; a host still on core
+  0.1 / http 0.3 cannot. That is the breaking change, and why this is a minor.
+- **A Zoom answer's body is read within 1 MiB.** ikigai-http 0.4 makes `HttpResponse::body` an
+  owned `HttpBody` the host may stream (`HttpBody::from_reader`) instead of a `Vec<u8>`, so this
+  crate now collects it under a bound: a success body past 1 MiB is `Error::OverBudget` (class
+  `over-budget`, already declared by the Sink) instead of being buffered whole; a body that fails
+  mid-read is ikigai-http's `Timeout`/`Unavailable`. An error answer whose body cannot be read
+  keeps its status-table row and says `(body unreadable)` in place of the server's `message`.
+- **ikigai-vocab 0.1.108 → 0.2.0, ikigai-conformance 0.10.0 → 0.11.0** (dev-dependencies).
+  Conformance 0.11 runs DATATYPES and FAILURES by default; both are clean here with nothing
+  waived (`ik:passcode` is an `xsd:string`, `ical:dtstart` is tagged `xsd:dateTime`).
+
 ## 0.4.0
 
 ### Changed (BREAKING: a minor release, not a patch)

@@ -61,7 +61,7 @@ fn response(status: u16, body: Value) -> HttpResponse {
     HttpResponse {
         status,
         headers: vec![],
-        body: serde_json::to_vec(&body).unwrap(),
+        body: serde_json::to_vec(&body).unwrap().into(),
     }
 }
 
