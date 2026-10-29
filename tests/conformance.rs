@@ -53,6 +53,11 @@
 //!   literal, `ical:dtstart`, is tagged `^^xsd:dateTime`. The walk is
 //!   clean — [`conforms`] asserts exactly that, with no term carved out.
 //!
+//! - `BODIES` and `BODY-INPUTS` run by default since conformance 0.12.0. The
+//!   suite receives the kernel's shared space. This module has only Sink actions
+//!   and no `reads_body` arguments, so neither check has an eligible target;
+//!   no content store or opt-out is needed. [`conforms`] rejects unprobed checks.
+//!
 //! ## What the suite cannot see, pinned by hand
 //!
 //! - **Denied before any secret is read or any socket opens**
@@ -577,6 +582,7 @@ fn conforms() {
     ));
     let kernel = Kernel::new(space.clone());
     let report = Suite::new()
+        .body_space(space.clone())
         .host_named_space("ikigai_meeting::space(transport, secrets, config)", space)
         // The one action is a Sink, so REQUIRED would walk nothing without this; every
         // drop lands on the fixture and is refused before the stub or the keystore.
@@ -602,6 +608,7 @@ fn conforms() {
     // term, and the module's last VOCABULARY finding — is defined by the shared
     // vocabulary as of `ikigai-vocab` 0.1.69.
     assert!(report.is_clean(), "{report}");
+    assert!(report.unprobed.is_empty(), "{report}");
 
     // One description, two entries, one Sink action each; nothing skipped;
     // nothing declared but the two opt-ins and the probes.
