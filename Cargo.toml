@@ -41,13 +41,9 @@ url = "2"
 
 [dev-dependencies]
 futures = "0.3"
-# The module recipe as one test (`tests/conformance.rs`). 0.11.0 is the conformance line on
-# ikigai-core 0.2.0 (ledger #2261), and it turns two checks on by default: FAILURES (judges only
-# actions that state failure classes; the `fails_under` probes hold the Zoom action to the
-# classes it declares, ledger #1546) and DATATYPES (a Turtle face's literal for an ik: property
-# must carry the property's declared rdfs:range datatype). A 0.x caret is a CEILING too:
-# "0.11.0" admits 0.11.x only, so the next minor is a deliberate pin change.
-ikigai-conformance = "0.11.0"
+# The module recipe as one test (`tests/conformance.rs`). 0.12.0 enables BODIES
+# and BODY-INPUTS by default. A 0.x caret admits only this minor line.
+ikigai-conformance = "0.12.0"
 # The cross-face term-equality test (`tests/conformance.rs`): compares the Turtle face as
 # parsed RDF terms, and reads `ik:passcode`'s declared range from the shared vocabulary.
 # oxrdf 0.3 is the term model `ikigai_conformance::rdf::parse` returns; ikigai-vocab moves in
