@@ -86,9 +86,9 @@ pub const CAP_SECRET_READ: &str = "urn:cap:secret:read:*";
 /// default.
 pub const FACES: [&str; 3] = ["text/plain", "text/turtle", "application/json"];
 
-/// The endpoint's one name: its description id (the MCP projection's tool name) and its catalog
-/// label. Both bound IRIs, `urn:meeting:schedule` and `urn:meeting:zoom:schedule`, reach it.
-const ID: &str = "meeting";
+/// Stable description ids and catalog labels for the two scheduling doors.
+const ZOOM_ID: &str = "meeting-zoom-schedule";
+const FACADE_ID: &str = "meeting-schedule";
 
 /// The meeting length when `duration` is not given, in minutes.
 pub const DEFAULT_MINUTES: u32 = 30;
@@ -238,21 +238,27 @@ pub fn space(
     config: ZoomConfig,
 ) -> EndpointSpace {
     let zoom = ZoomBackend {
+        id: ZOOM_ID,
         transport,
         secrets,
         config,
         tokens: Arc::default(),
     };
+    let facade = ZoomBackend {
+        id: FACADE_ID,
+        ..zoom.clone()
+    };
     EndpointSpace::new()
-        .bind(Exact::new("urn:meeting:zoom:schedule"), zoom.clone())
-        .bind(Exact::new("urn:meeting:schedule"), zoom)
+        .bind(Exact::new("urn:meeting:zoom:schedule"), zoom)
+        .bind(Exact::new("urn:meeting:schedule"), facade)
 }
 
 /// The Zoom backend: exchange the S2S credentials for a bearer token, then create a scheduled
-/// meeting. Cloneable so the facade and the direct alias can share one configuration and one
+/// meeting. Cloneable so the facade and the backend can share one configuration and one
 /// token cache.
 #[derive(Clone)]
 pub struct ZoomBackend {
+    id: &'static str,
     transport: Arc<dyn HttpTransport>,
     secrets: Arc<dyn SecretReader>,
     config: ZoomConfig,
@@ -447,16 +453,13 @@ impl Endpoint for ZoomBackend {
         })
     }
 
-    // The catalog's short label and the description id are one name, `meeting`: a short noun in
-    // kebab-case (ikigai-core's naming conventions). Both bound IRIs reach this one endpoint, so
-    // the name is neither IRI. The id is the contract (selection and a conformance fixture key on
-    // it) and the MCP projection's tool name, so renaming it moves an agent's tool list.
+    // Each door has its own published id; the catalog and description must agree.
     fn name(&self) -> &str {
-        ID
+        self.id
     }
 
     fn describe(&self) -> Description {
-        Description::new(ID)
+        Description::new(self.id)
             .summary(
                 "Schedule a Zoom meeting. Returns the join URL (text), the shareable graph \
                  (as=text/turtle — ical:conference), or the full envelope (as=application/json, \
