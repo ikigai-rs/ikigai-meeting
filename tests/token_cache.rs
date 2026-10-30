@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// The Zoom backend's own entry, and the facade that reaches the same endpoint.
+/// The Zoom backend's own entry, and the facade sharing its token cache.
 const ZOOM: &str = "urn:meeting:zoom:schedule";
 const FACADE: &str = "urn:meeting:schedule";
 const T0: u64 = 1_700_000_000_000;

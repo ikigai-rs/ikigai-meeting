@@ -95,10 +95,18 @@ vocabulary does not define yet.
 
 ## Naming
 
-Both IRIs reach one endpoint, whose description id and catalog label are one short noun:
-**`meeting`**. The id is what the MCP projection turns into an agent's tool name, so the tool an
-agent sees for this module is named from `meeting`. Before 0.2.0 the id was the full IRI
-`urn:meeting:zoom:schedule`; the IRIs themselves did not change (see `CHANGELOG.md`).
+Each schedule endpoint has its own stable description id and matching catalog label:
+
+| Bound IRI | Description id / catalog label |
+| --- | --- |
+| `urn:meeting:schedule` (facade) | `meeting-schedule` |
+| `urn:meeting:zoom:schedule` (Zoom backend) | `meeting-zoom-schedule` |
+
+These short kebab-case ids are also the names used by the MCP projection and by arrangement
+`door` declarations. Since 0.7.0, each id identifies exactly one endpoint when both are bound in
+one kernel. Consumers matching the old shared id `meeting` must use the appropriate new id.
+The bound IRIs are unchanged, and the facade and backend still share configuration and the
+token cache. See `CHANGELOG.md` for the earlier naming history.
 
 ## Status
 

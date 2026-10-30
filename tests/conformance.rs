@@ -1,7 +1,6 @@
 //! The module recipe as one test: `ikigai-conformance` walks the two entries
-//! [`ikigai_meeting::space`] binds — one description, `meeting`, reachable as the
-//! Zoom backend's `urn:meeting:zoom:schedule` and as the `urn:meeting:schedule`
-//! facade — and reports every violation at once.
+//! [`ikigai_meeting::space`] binds — the Zoom backend and the scheduling facade,
+//! each with its own description id — and reports every violation at once.
 //!
 //! ## The fixture kernel: a loopback Zoom, and a secret reader that counts
 //!
@@ -22,10 +21,9 @@
 //! - Nothing is `pure` and nothing is `cacheable`: a schedule is an effect, and
 //!   the suite's cache probe never runs on a Sink anyway. That it is live is
 //!   pinned by hand ([`a_schedule_is_never_cached`], conformance PENDING #22).
-//! - Every check runs, `NAMES` included: the id is `meeting`, a kebab-case noun,
-//!   and the catalog label `name()` is the same word. It was the full IRI
-//!   `urn:meeting:zoom:schedule` until the naming wave (ledger #11), which is why
-//!   [`the_id_is_a_kebab_case_noun`] pins NAMES on its own.
+//! - Every check runs, `NAMES` included: both ids are kebab-case nouns,
+//!   and each catalog label `name()` matches its description id.
+//!   [`the_ids_are_kebab_case_nouns`] pins NAMES on its own.
 //! - `space(transport, secrets, config)` is declared HOST-named
 //!   (`Suite::host_named_space`, SPACE-NAME): it is instance-built, so its doors
 //!   answer to whatever the host handed it, and it carries no name of its own.
@@ -93,8 +91,7 @@
 //!   only `topic` and `start` required (that each is really required is
 //!   `REQUIRED`'s, under [`conforms`]), the five failure classes the status table
 //!   and the transport can answer, and the entry's `name()` is the description
-//!   id, `meeting` — before the naming wave they differed, and a fixture keyed on
-//!   the name was silently inert (PENDING #57).
+//!   id. Fixtures address each door by its own published id.
 
 use async_trait::async_trait;
 use ikigai_conformance::{Check, Checks, Fixture, Suite};
@@ -111,9 +108,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use url::Url;
 
-/// The one description id, the Zoom backend's own entry, and the two entries that
-/// reach the description.
-const ID: &str = "meeting";
+/// The two description ids, in the same order as their bound entries.
+const IDS: [&str; 2] = ["meeting-zoom-schedule", "meeting-schedule"];
 const ZOOM: &str = "urn:meeting:zoom:schedule";
 const ENTRIES: [&str; 2] = [ZOOM, "urn:meeting:schedule"];
 
@@ -581,7 +577,7 @@ fn conforms() {
         config(&stub, "/v2"),
     ));
     let kernel = Kernel::new(space.clone());
-    let report = Suite::new()
+    let mut suite = Suite::new()
         .body_space(space.clone())
         .host_named_space("ikigai_meeting::space(transport, secrets, config)", space)
         // The one action is a Sink, so REQUIRED would walk nothing without this; every
@@ -591,16 +587,19 @@ fn conforms() {
         // declaration asserted below): the Sink is held to the
         // failure classes it declares (ledger #1546), and two probes provoke the two an
         // origin answers that a walk cannot: the stub keys them on the topic.
-        .check_failures()
-        .fails_under(
-            Fixture::new(ID, Verb::Sink).arg("topic", LIMITED_TOPIC),
-            FailureClass::RetryAfter,
-        )
-        .fails_under(
-            Fixture::new(ID, Verb::Sink).arg("topic", LOCKED_TOPIC),
-            FailureClass::Refused,
-        )
-        .run_blocking(&kernel);
+        .check_failures();
+    for id in IDS {
+        suite = suite
+            .fails_under(
+                Fixture::new(id, Verb::Sink).arg("topic", LIMITED_TOPIC),
+                FailureClass::RetryAfter,
+            )
+            .fails_under(
+                Fixture::new(id, Verb::Sink).arg("topic", LOCKED_TOPIC),
+                FailureClass::Refused,
+            );
+    }
+    let report = suite.run_blocking(&kernel);
     // Printed even when clean (`--nocapture`): the report is the record.
     eprintln!("{report}");
 
@@ -610,9 +609,9 @@ fn conforms() {
     assert!(report.is_clean(), "{report}");
     assert!(report.unprobed.is_empty(), "{report}");
 
-    // One description, two entries, one Sink action each; nothing skipped;
+    // Two descriptions, two entries, one Sink action each; nothing skipped;
     // nothing declared but the two opt-ins and the probes.
-    assert_eq!(report.endpoints, 1, "{report}");
+    assert_eq!(report.endpoints, IDS.len(), "{report}");
     assert_eq!(report.actions, ENTRIES.len(), "{report}");
     assert_eq!(
         report.checks.skipped().collect::<Vec<_>>(),
@@ -633,7 +632,7 @@ fn conforms() {
     let probes = &report.declared.evidence.fails_under;
     assert_eq!(probes.len(), PROBE_FIRINGS, "{report}");
     for probe in probes {
-        assert_eq!(probe.endpoint, ID, "{report}");
+        assert!(IDS.contains(&probe.endpoint.as_str()), "{report}");
         assert_eq!(probe.got, Some(probe.expected), "{report}");
     }
     let seen = &report.declared.evidence.failures;
@@ -664,24 +663,19 @@ fn conforms() {
     }
 }
 
-/// How many times the two `fails_under` probes fire the Sink: once per probe PER ENTRY. Both
-/// probes name the one description id, and the suite lays each over every entry that reaches
-/// it (measured on conformance 0.10.0 and 0.11.0: four `fails under:` lines for two probes), so each
-/// probe is a token exchange and a refused create on each of the two IRIs.
-const PROBE_FIRINGS: usize = 2 * ENTRIES.len();
+/// Two failure probes per endpoint id, each naming exactly one entry.
+const PROBE_FIRINGS: usize = 2 * IDS.len();
 
-/// The finding the naming wave (ledger #11) flipped: the id was the full IRI
-/// `urn:meeting:zoom:schedule`, and NAMES flagged it. Now it is `meeting`, a
-/// kebab-case noun, and NAMES alone finds nothing.
+/// Both published ids obey core's kebab-case naming convention.
 #[test]
-fn the_id_is_a_kebab_case_noun() {
+fn the_ids_are_kebab_case_nouns() {
     let stub = Stub::start();
     let kernel = kernel(&stub, Arc::new(Secrets::default()), "/v2");
     let report = Suite::new().checks(Checks::NAMES).run_blocking(&kernel);
     eprintln!("{report}");
     assert_eq!(report.of(Check::Names).count(), 0, "{report}");
     assert!(report.is_clean(), "{report}");
-    assert_eq!(report.endpoints, 1, "{report}");
+    assert_eq!(report.endpoints, IDS.len(), "{report}");
     assert_eq!(stub.connections(), 0, "NAMES is a static check");
 }
 
@@ -1201,7 +1195,7 @@ fn content_is_the_agenda_when_piped() {
 }
 
 /// The contract as the manifold states it: one Sink action per entry, both
-/// entries one description; exactly the two capability families; every input
+/// entries with distinct description ids; exactly the two capability families; every input
 /// classed; only `topic` and `start` required; `content` declared and optional;
 /// `as` enumerates the faces with the join URL as its default. And the entry's
 /// `name()` is the id.
@@ -1209,9 +1203,9 @@ fn content_is_the_agenda_when_piped() {
 fn the_manifold_states_the_contract() {
     let stub = Stub::start();
     let kernel = kernel(&stub, Arc::new(Secrets::default()), "/v2");
-    for iri in ENTRIES {
+    for (iri, id) in ENTRIES.into_iter().zip(IDS) {
         let description = kernel.describe_pattern(iri).unwrap();
-        assert_eq!(description.id, ID, "{iri}: one description");
+        assert_eq!(description.id, id, "{iri}: its own description");
         let specs = description.action_specs();
         assert_eq!(specs.len(), 1, "{iri}: one action");
         let spec = &specs[0];
@@ -1283,11 +1277,11 @@ fn the_manifold_states_the_contract() {
         .collect();
     assert_eq!(ours.len(), ENTRIES.len());
     for entry in ours {
-        // `name()` and the id are one word since the naming wave (ledger #11):
-        // before it a conformance fixture keyed on `meeting` matched nothing
-        // (PENDING #57).
-        assert_eq!(entry.endpoint, "meeting", "{}", entry.pattern);
-        assert_eq!(entry.endpoint, ID, "{}", entry.pattern);
+        let index = ENTRIES
+            .iter()
+            .position(|iri| *iri == entry.pattern)
+            .unwrap();
+        assert_eq!(entry.endpoint, IDS[index], "{}", entry.pattern);
     }
     assert_eq!(SECRET_NAMES.len(), secret_grants().len());
 }
@@ -1297,4 +1291,16 @@ fn the_manifold_states_the_contract() {
 /// stub must see, and what no error may carry.
 fn basic_header() -> ikigai_http::auth::Authorization {
     ikigai_http::auth::basic(CLIENT_ID, CLIENT_SECRET).expect("the fake credentials encode")
+}
+
+#[test]
+fn schedule_endpoints_have_distinct_stable_ids() {
+    let stub = Stub::start();
+    let kernel = kernel(&stub, Arc::new(Secrets::default()), "/v2");
+    let zoom = kernel.describe_pattern(ZOOM).unwrap();
+    let facade = kernel.describe_pattern("urn:meeting:schedule").unwrap();
+    assert_ne!(zoom.id, facade.id, "each arrangement door needs its own id");
+    assert_eq!(zoom.id, "meeting-zoom-schedule");
+    assert_eq!(facade.id, "meeting-schedule");
+    assert_eq!(stub.connections(), 0);
 }

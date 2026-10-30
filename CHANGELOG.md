@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.0
+
+### Changed (BREAKING: a minor release, not a patch)
+
+- Replace the shared description id and catalog label `meeting` with `meeting-schedule` for
+  `urn:meeting:schedule` and `meeting-zoom-schedule` for `urn:meeting:zoom:schedule`. Each id now
+  identifies exactly one endpoint in an arrangement dump. Consumers matching ids, arrangement
+  doors, or MCP tool names must adopt the new names. Bound IRIs and scheduling behavior are
+  unchanged; both doors continue sharing their configuration and token cache.
+
 ## 0.5.0
 
 ### Changed (BREAKING: a minor release, not a patch)
