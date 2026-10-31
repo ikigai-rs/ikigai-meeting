@@ -114,3 +114,7 @@ token cache. See `CHANGELOG.md` for the earlier naming history.
 host must bind this crate's space *and* supply a `SecretReader`, with the three Zoom credentials
 stored under the names "Zoom setup" gives. Google Meet and Teams backends, and the org-entry
 scheduling path, do not exist yet.
+
+## Accessibility
+
+The meeting faces and refusals this crate writes, the rules they follow, how they are tested and their known limitations are in [ACCESSIBILITY.md](ACCESSIBILITY.md). Report a barrier with an issue carrying the `accessibility` label.
