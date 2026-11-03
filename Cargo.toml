@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-meeting"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -16,8 +16,13 @@ categories = ["web-programming"]
 # failure classes (`FailureClass`, `Error::class()`, `Refused`, `RetryAfter`, `OverBudget`,
 # `Unsupported`, `Description::fails`; ledger #1546) this crate's own code reads: the Zoom actions
 # declare the classes they can fail with, and the errors the shared status table answers are
-# those variants. It is also the line `ikigai-http = "0.4.0"` links, so the graph holds ONE core.
-ikigai-core = "0.2.0"
+# those variants.
+# 0.3.0 is the scoped content store (ledger #2965): held content is scoped to whoever delivered it,
+# a principal-less hold is root's, and `ContentStore::put`/`put_replay` are root-only. This crate
+# calls neither, but core's types are in `space()`'s signature, so the move is breaking for
+# consumers: hence meeting 0.8.0. It is also the line `ikigai-http = "0.6.0"` links, so the graph
+# holds ONE core.
+ikigai-core = "0.3.0"
 # The HTTP I/O seam (HttpTransport) + wire types. The host injects one transport
 # (ureq/reqwest natively, fetch in the browser); no HTTP client or executor is baked in.
 # `HttpTransport` is in `space()`'s signature, so a host passes the SAME ikigai-http line it
@@ -30,9 +35,10 @@ ikigai-core = "0.2.0"
 # and `net_allows_port` (the port-aware ACL) are unchanged since. 0.5.0 is conditional
 # revalidation (ledger #2535). `HttpTransport` is in THIS crate's public API (`space(transport,
 # ..)`), and a host passes one transport to http's space and this one, so moving this pin is
-# breaking for consumers: hence meeting 0.6.0. A 0.x caret is a CEILING too: "0.5.0" admits
-# 0.5.x only.
-ikigai-http = "0.5.0"
+# breaking for consumers: hence meeting 0.6.0. 0.6.0 is the ikigai-http line on ikigai-core 0.3.0
+# (the scoped content store, ledger #2965), hence meeting 0.8.0. A 0.x caret is a CEILING too:
+# "0.6.0" admits 0.6.x only.
+ikigai-http = "0.6.0"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -41,14 +47,15 @@ url = "2"
 
 [dev-dependencies]
 futures = "0.3"
-# The module recipe as one test (`tests/conformance.rs`). 0.12.0 enables BODIES
-# and BODY-INPUTS by default. A 0.x caret admits only this minor line.
-ikigai-conformance = "0.12.0"
+# The module recipe as one test (`tests/conformance.rs`). 0.12.0 enabled BODIES
+# and BODY-INPUTS by default; 0.14.0 is the line on ikigai-core 0.3.0 (ledger #2965), so the
+# test build links one core. A 0.x caret admits only this minor line.
+ikigai-conformance = "0.14.0"
 # The cross-face term-equality test (`tests/conformance.rs`): compares the Turtle face as
 # parsed RDF terms, and reads `ik:passcode`'s declared range from the shared vocabulary.
 # oxrdf 0.3 is the term model `ikigai_conformance::rdf::parse` returns; ikigai-vocab moves in
-# step with ikigai-core: 0.2.0 is the streams release (ledger #2261), what conformance 0.11.0
-# pins, and the old 0.1 pin meant <0.2.0 under 0.x rules; `ik:passcode` has been in it since
-# 0.1.69.
+# step with ikigai-core: 0.3.0 is the scoped content store release (ledger #2965), what
+# conformance 0.14.0 pins, and the old 0.2 pin meant <0.3.0 under 0.x rules; `ik:passcode` has
+# been in it since 0.1.69.
 oxrdf = "0.3"
-ikigai-vocab = "0.2.0"
+ikigai-vocab = "0.3.0"
