@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.0
+
+### Changed (BREAKING: a minor release, not a patch)
+
+- **ikigai-core 0.2 → 0.3.0, ikigai-http 0.5 → 0.6.0** (the scoped content store, ledger #2965).
+  Held content is now scoped to whoever delivered it, a principal-less hold is root's, and
+  `ContentStore::put`/`put_replay` are root-only. This crate calls neither, so its behavior does
+  not change. Core's types and `ikigai_http::HttpTransport` are in `space()`'s signature, so a
+  host hands this crate a transport from the ikigai-http 0.6 line on core 0.3; a host still on
+  core 0.2 / http 0.5 stays on meeting 0.7. That is the breaking change, and why this is a minor.
+- **ikigai-vocab 0.2 → 0.3.0, ikigai-conformance 0.12 → 0.14.0** (dev-dependencies), so the test
+  build links one core. The suite is clean on 0.14 with no test changed.
+
 ## 0.7.0
 
 ### Changed (BREAKING: a minor release, not a patch)
