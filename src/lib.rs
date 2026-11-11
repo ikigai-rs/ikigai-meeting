@@ -64,6 +64,7 @@
 #![forbid(unsafe_code)]
 
 use async_trait::async_trait;
+use chrono::{DateTime, NaiveDateTime, SecondsFormat, TimeZone, Utc};
 use ikigai_core::{
     ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, FailureClass, Invocation,
     ReprType, Representation, Result, Time, Verb,
@@ -367,21 +368,34 @@ impl Endpoint for ZoomBackend {
         // `InvalidArgument` that names the input and never echoes the value.
         let topic = required(inv, "topic")?;
         let start = required(inv, "start")?.trim().to_string();
+        let timezone = optional(inv, "timezone")?;
+        let zone = timezone
+            .as_deref()
+            .map(|name| {
+                name.parse::<chrono_tz::Tz>()
+                    .map_err(|_| invalid("timezone", "not a recognized IANA time zone"))
+            })
+            .transpose()?;
         if !is_xsd_datetime(&start) {
             return Err(invalid(
                 "start",
                 "not an xsd:dateTime (YYYY-MM-DDThh:mm:ss, optionally .fff and Z or ±hh:mm)",
             ));
         }
-        let duration = match optional(inv, "duration") {
+        let start = normalize_start(&start, zone)?;
+        let duration = match optional(inv, "duration")? {
             None => DEFAULT_MINUTES,
             Some(minutes) => match minutes.parse::<u32>() {
-                Ok(n) if n >= 1 => n,
-                _ => return Err(invalid("duration", "not a positive xsd:integer (minutes)")),
+                Ok(n) if (1..=1440).contains(&n) => n,
+                _ => {
+                    return Err(invalid(
+                        "duration",
+                        "not a positive xsd:integer of minutes, at most one day",
+                    ))
+                }
             },
         };
-        let timezone = optional(inv, "timezone");
-        let attendees = match optional(inv, "attendees") {
+        let attendees = match optional(inv, "attendees")? {
             None => Vec::new(),
             Some(list) => parse_attendees(&list).ok_or_else(|| {
                 invalid(
@@ -391,8 +405,10 @@ impl Endpoint for ZoomBackend {
             })?,
         };
         // Pipeline citizenship: a named `agenda` wins; the piped `content` is the fallback.
-        let agenda = optional(inv, "agenda").or_else(|| optional(inv, "content"));
-        let face = optional(inv, "as").unwrap_or_else(|| FACES[0].to_string());
+        let agenda = optional(inv, "agenda")?;
+        let content = optional(inv, "content")?;
+        let agenda = agenda.or(content);
+        let face = optional(inv, "as")?.unwrap_or_else(|| FACES[0].to_string());
         if !FACES.contains(&face.as_str()) {
             return Err(invalid(
                 "as",
@@ -476,21 +492,21 @@ impl Endpoint for ZoomBackend {
             .input(
                 ArgSpec::new("start")
                     .summary(
-                        "start time, ISO 8601 (e.g. 2026-07-30T15:00:00Z, or a local time with \
-                         `timezone`)",
+                        "start time: RFC 3339 with an offset, or local time with `timezone`; \
+                         DST gaps and overlaps require an offset; answers use UTC",
                     )
                     .class(XSD_DATETIME),
             )
             .input(
                 ArgSpec::new("duration")
-                    .summary("length in minutes")
+                    .summary("length in minutes, an integer from 1 through 1440 (default 30)")
                     .class(XSD_INTEGER)
                     .default_value(DEFAULT_MINUTES.to_string())
                     .optional(),
             )
             .input(
                 ArgSpec::new("timezone")
-                    .summary("IANA zone the start time is in (e.g. America/Los_Angeles)")
+                    .summary("IANA zone for local start times (e.g. America/Los_Angeles); omitted uses the Zoom account zone")
                     .class(XSD_STRING)
                     .optional(),
             )
@@ -721,24 +737,35 @@ impl ZoomBackend {
             .as_i64()
             .map(|n| n.to_string())
             .or_else(|| v["id"].as_str().map(str::to_string))
-            .ok_or_else(|| Error::Endpoint("zoom create-meeting: no id in response".to_string()))?;
-        let join_url = v["join_url"].as_str().unwrap_or("").to_string();
-        if join_url.is_empty() {
-            return Err(Error::Endpoint(
-                "zoom create-meeting: no join_url in response".to_string(),
-            ));
-        }
+            .filter(|id| {
+                !id.is_empty()
+                    && id.bytes().all(|b| b.is_ascii_digit())
+                    && id.bytes().any(|b| b != b'0')
+            })
+            .ok_or_else(|| response_field("id"))?;
+        let join_url = response_string(&v, "join_url")?;
+        let start_url = response_string(&v, "start_url")?;
+        let topic = response_string(&v, "topic")?;
+        let start = response_string(&v, "start_time")?;
+        let start_time = utc_datetime(&start).ok_or_else(|| response_field("start_time"))?;
+        let duration = v["duration"]
+            .as_u64()
+            .filter(|n| (1..=1440).contains(n))
+            .ok_or_else(|| response_field("duration"))? as u32;
+        // A meeting need not have a passcode. Preserve absence rather than inventing one.
+        let passcode = match v.get("password") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value)) => Some(value.clone()),
+            _ => return Err(response_field("password")),
+        };
         Ok(Created::Meeting(Meeting {
             id,
             join_url,
-            start_url: v["start_url"].as_str().unwrap_or("").to_string(),
-            passcode: v["password"].as_str().unwrap_or("").to_string(),
-            topic: request.topic.clone(),
-            start_time: v["start_time"]
-                .as_str()
-                .unwrap_or(&request.start)
-                .to_string(),
-            duration: request.duration,
+            start_url,
+            passcode,
+            topic,
+            start_time,
+            duration,
             attendees: request.attendees.clone(),
         }))
     }
@@ -856,18 +883,20 @@ fn is_email(s: &str) -> bool {
 
 /// A required by-value input, or `MissingArgument` naming it.
 fn required(inv: &Invocation<'_>, name: &str) -> Result<String> {
-    inv.inline_str(name)
-        .map(str::to_string)
-        .map_err(|_| Error::MissingArgument(name.to_string()))
+    match inv.inline_str(name) {
+        Ok(value) => Ok(value.to_string()),
+        Err(Error::MissingArgument(_)) => Err(Error::MissingArgument(name.to_string())),
+        Err(_) => Err(invalid(name, "expected an inline UTF-8 value")),
+    }
 }
 
-/// An optional by-value input, trimmed; absent or blank is `None`.
-fn optional(inv: &Invocation<'_>, name: &str) -> Option<String> {
-    inv.inline_str(name)
-        .ok()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+/// An optional by-value input. Only absence selects a default; decoding errors propagate.
+fn optional(inv: &Invocation<'_>, name: &str) -> Result<Option<String>> {
+    match inv.inline_str(name) {
+        Ok(value) => Ok(Some(value.trim().to_string())),
+        Err(Error::MissingArgument(_)) => Ok(None),
+        Err(_) => Err(invalid(name, "expected an inline UTF-8 value")),
+    }
 }
 
 fn invalid(name: &str, detail: &str) -> Error {
@@ -928,8 +957,8 @@ fn scrub(text: String, secrets: &[&str]) -> String {
 }
 
 /// A lexical `xsd:dateTime` (the shape Zoom accepts): `YYYY-MM-DDThh:mm:ss`, an optional
-/// fractional second, an optional `Z` or `±hh:mm`. Field ranges are the provider's to judge.
-fn is_xsd_datetime(s: &str) -> bool {
+/// fractional second, an optional `Z` or `±hh:mm`. Calendar ranges are checked separately.
+fn has_datetime_shape(s: &str) -> bool {
     let b = s.as_bytes();
     if b.len() < 19 {
         return false;
@@ -968,13 +997,82 @@ fn is_xsd_datetime(s: &str) -> bool {
     }
 }
 
+/// A valid date and clock time, with either an explicit offset or no offset.
+fn is_xsd_datetime(s: &str) -> bool {
+    has_datetime_shape(s) && (utc_datetime(s).is_some() || local_datetime(s).is_some())
+}
+
+fn local_datetime(s: &str) -> Option<NaiveDateTime> {
+    NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f").ok()
+}
+
+/// Zoom documents UTC `Z` on the wire; numeric offsets are converted without changing the instant.
+fn utc_datetime(s: &str) -> Option<String> {
+    if !has_datetime_shape(s) {
+        return None;
+    }
+    let parsed = DateTime::parse_from_rfc3339(s).ok()?;
+    // xsd:dateTime's timezone range is -14:00 through +14:00.
+    if parsed.offset().local_minus_utc().unsigned_abs() > 14 * 3600 {
+        return None;
+    }
+    Some(format_utc(parsed.with_timezone(&Utc), s))
+}
+
+/// Offsets change whole seconds only. Carry the original fractional digits unchanged rather
+/// than rounding to the date library's nanosecond precision.
+fn format_utc(time: DateTime<Utc>, source: &str) -> String {
+    let mut out = time.to_rfc3339_opts(SecondsFormat::Secs, true);
+    if source.as_bytes().get(19) == Some(&b'.') {
+        let digits = source[20..].bytes().take_while(u8::is_ascii_digit).count();
+        out.insert_str(out.len() - 1, &source[19..20 + digits]);
+    }
+    out
+}
+
+fn normalize_start(s: &str, zone: Option<chrono_tz::Tz>) -> Result<String> {
+    if let Some(utc) = utc_datetime(s) {
+        return Ok(utc);
+    }
+    let local =
+        local_datetime(s).ok_or_else(|| invalid("start", "not a valid calendar date and time"))?;
+    match zone {
+        Some(zone) => zone
+            .from_local_datetime(&local)
+            .single()
+            .map(|dt| format_utc(dt.with_timezone(&Utc), s))
+            .ok_or_else(|| {
+                invalid(
+                    "start",
+                    "local time is in a DST gap or overlap; provide an explicit UTC offset",
+                )
+            }),
+        // Zoom's documented default is the account's zone, which this module cannot inspect.
+        None => Ok(s.to_string()),
+    }
+}
+
+fn response_field(name: &str) -> Error {
+    Error::Endpoint(format!(
+        "zoom create-meeting: missing or invalid {name} in response"
+    ))
+}
+
+fn response_string(v: &Value, name: &str) -> Result<String> {
+    v[name]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| response_field(name))
+}
+
 /// A scheduled meeting, provider-neutral.
 struct Meeting {
     id: String,
     join_url: String,
     /// The host URL — carries a start token, so it is NEVER in the shareable turtle face.
     start_url: String,
-    passcode: String,
+    passcode: Option<String>,
     topic: String,
     start_time: String,
     duration: u32,
@@ -1013,8 +1111,10 @@ impl Meeting {
             "    ical:conference {} ;\n",
             ttl_iri(&self.join_url)
         ));
-        if !self.passcode.is_empty() {
-            s.push_str(&format!("    ik:passcode {} ;\n", ttl_str(&self.passcode)));
+        if let Some(passcode) = &self.passcode {
+            if !passcode.is_empty() {
+                s.push_str(&format!("    ik:passcode {} ;\n", ttl_str(passcode)));
+            }
         }
         for attendee in &self.attendees {
             s.push_str(&format!(
@@ -1119,7 +1219,7 @@ mod tests {
             let body = if request.url.contains("/oauth/token") {
                 r#"{"access_token":"tok-123","token_type":"bearer","expires_in":3600}"#
             } else if request.url.contains("/meetings") {
-                r#"{"id":88899900011,"join_url":"https://zoom.us/j/88899900011?pwd=abc","start_url":"https://zoom.us/s/88899900011?zak=SECRET","password":"a1b2c3","start_time":"2026-07-30T22:00:00Z"}"#
+                r#"{"id":88899900011,"join_url":"https://zoom.us/j/88899900011?pwd=abc","start_url":"https://zoom.us/s/88899900011?zak=SECRET","password":"a1b2c3","topic":"Intro call","duration":30,"start_time":"2026-07-30T22:00:00Z"}"#
             } else {
                 return Err(format!("unexpected url {}", request.url));
             };
@@ -1504,7 +1604,7 @@ mod tests {
             } else {
                 (
                     200,
-                    br#"{"id":1,"join_url":"https://zoom.us/j/1"}"#.to_vec(),
+                    br#"{"id":1,"join_url":"https://zoom.us/j/1","start_url":"https://zoom.us/s/1","topic":"t","duration":30,"start_time":"2026-07-30T22:00:00Z"}"#.to_vec(),
                 )
             };
             Ok(HttpResponse {

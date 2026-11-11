@@ -370,14 +370,17 @@ fn respond(method: &str, path: &str, authorization: &str, request: &[u8]) -> Rep
                     r#"{"code":124,"message":"Invalid access token."}"#.to_string(),
                 ),
                 _ => {
-                    let start =
-                        field("start_time").unwrap_or_else(|| "2026-01-01T00:00:00Z".to_string());
+                    let body: serde_json::Value = serde_json::from_slice(request).unwrap();
                     json(
                         200,
                         "OK",
-                        format!(
-                            r#"{{"id":88899900011,"join_url":"{JOIN_URL}","start_url":"https://zoom.us/s/88899900011?zak=HOST-SECRET","password":"a1b2c3","start_time":"{start}"}}"#
-                        ),
+                        serde_json::json!({
+                            "id":88899900011u64, "join_url":JOIN_URL,
+                            "start_url":"https://zoom.us/s/88899900011?zak=HOST-SECRET",
+                            "password":"a1b2c3", "start_time":body["start_time"],
+                            "topic":body["topic"], "duration":body["duration"]
+                        })
+                        .to_string(),
                     )
                 }
             }

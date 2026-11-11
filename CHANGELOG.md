@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Validate calendar dates, UTC offsets, and IANA timezones before scheduling. Convert explicit
+  instants and unambiguous local times in named zones to UTC, preserving fractional seconds;
+  refuse daylight saving gaps and overlaps without an explicit offset.
+- Enforce Zoom's duration range of 1–1440 whole minutes; retain the 30-minute default.
+- Refuse invalid present arguments instead of treating them as missing or defaulted. An empty
+  named agenda wins over piped content.
+- Build answers from Zoom's returned topic, duration, and start time; report malformed required
+  response fields. Report an absent passcode as JSON null and preserve returned string codes.
+- Add hermetic regressions for scheduling contracts and confirm schedule answers are never cached.
+
 ## 0.8.0
 
 ### Changed (BREAKING: a minor release, not a patch)

@@ -100,6 +100,8 @@ impl HttpTransport for FakeZoom {
                     "join_url": "https://zoom.us/j/88899900011?pwd=abc",
                     "start_url": "https://zoom.us/s/88899900011?zak=fake",
                     "password": "a1b2c3",
+                    "topic": "t",
+                    "duration": 30,
                     "start_time": "2026-01-01T00:00:00Z"
                 }),
             ));
