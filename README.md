@@ -29,6 +29,27 @@ meeting's invitees.
 - `as=application/json` → the **full envelope** for the trusted caller, including the host
   `start_url` (which carries a start token)
 
+`start` must be a real calendar date and time. An explicit `Z` or numeric offset fixes the
+instant; it is sent to Zoom in UTC with fractional digits preserved. A time without an offset
+is resolved in the supplied IANA `timezone`. Unknown zones and local times in a daylight saving
+gap or overlap are refused; use an explicit offset to select an instant during an overlap.
+Without either an offset or `timezone`, Zoom uses the account's timezone, so this module cannot
+check that zone's daylight saving transitions. The JSON and Turtle answers report Zoom's
+returned start time in UTC, including when Zoom adjusts a past start to the current time.
+These wire forms follow the [Zoom Meetings API](https://developers.zoom.us/docs/api/meetings/).
+
+`duration` is whole minutes from 1 through 1440; the module's default is 30. Only an absent
+optional argument selects a default. Invalid UTF-8 and blank duration, timezone, attendees,
+or face values are refused. A blank named agenda is an explicit empty agenda and wins over
+piped content.
+
+The answer's topic, duration, and start time come from the created meeting's response.
+Missing, null, or malformed required response fields are reported as endpoint errors rather
+than replaced with request values. A missing or null Zoom `password` is JSON `passcode: null`;
+a returned string retains its spelling, including leading zeros. No schedule answer is cached:
+every invocation creates a meeting. `ttl_str` in the implementation escapes Turtle strings;
+it does not calculate a cache lifetime.
+
 ## Injection, not dependencies
 
 Like ikigai-llm, no HTTP client and no keystore are baked in. The host injects:
