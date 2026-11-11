@@ -7,6 +7,7 @@ use ikigai_core::{
 use ikigai_http::{HttpRequest, HttpResponse, HttpTransport};
 use ikigai_meeting::{space, SecretReader, ZoomConfig};
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 struct Secrets;
@@ -16,12 +17,14 @@ impl SecretReader for Secrets {
     }
 }
 struct Stub {
+    calls: AtomicUsize,
     reply: Value,
     seen: Mutex<Vec<Value>>,
 }
 #[async_trait]
 impl HttpTransport for Stub {
     async fn send(&self, req: HttpRequest) -> Result<HttpResponse, String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         let body = if req.url.ends_with("/oauth/token") {
             json!({"access_token":"fake-token", "expires_in":3600})
         } else {
@@ -43,6 +46,7 @@ fn reply() -> Value {
 }
 fn setup(reply: Value) -> (Kernel, Arc<Stub>) {
     let stub = Arc::new(Stub {
+        calls: AtomicUsize::new(0),
         reply,
         seen: Mutex::default(),
     });
@@ -72,7 +76,7 @@ fn invalid_before_http(name: &str, value: &[u8], extra: &[(&str, &[u8])]) {
         matches!(result, Err(Error::InvalidArgument {name:ref n,..}) if n == name),
         "{name}: {result:?}"
     );
-    assert!(stub.seen.lock().unwrap().is_empty());
+    assert_eq!(stub.calls.load(Ordering::SeqCst), 0);
 }
 #[test]
 fn invalid_calendar_dates_and_offsets_are_refused() {
@@ -262,5 +266,98 @@ fn schedule_answers_are_never_cached_for_any_start_or_zone() {
             assert_eq!(result.expiry, Expiry::Always);
         }
         assert_eq!(stub.seen.lock().unwrap().len(), 2);
+    }
+}
+
+#[test]
+fn the_answer_uses_the_created_duration() {
+    let (k, _) = setup(reply());
+    let result: Value = serde_json::from_slice(&issue(&k, &[]).unwrap().bytes).unwrap();
+    assert_eq!(result["duration"], 45);
+}
+#[test]
+fn present_invalid_required_values_are_not_reported_as_missing() {
+    for name in ["topic", "start"] {
+        invalid_before_http(name, &[0xff], &[]);
+    }
+}
+#[test]
+fn malformed_ids_and_passcodes_are_refused() {
+    for (field, value) in [
+        ("id", json!("")),
+        ("id", json!(-1)),
+        ("id", json!("abc")),
+        ("password", json!(123)),
+    ] {
+        let mut body = reply();
+        body[field] = value;
+        let (k, _) = setup(body);
+        assert!(
+            matches!(issue(&k, &[]), Err(Error::Endpoint(ref text)) if text.contains(field)),
+            "{field}"
+        );
+    }
+}
+#[test]
+fn a_blank_named_agenda_wins_over_content() {
+    let (k, stub) = setup(reply());
+    issue(&k, &[("agenda", b""), ("content", b"fallback")]).unwrap();
+    assert_eq!(stub.seen.lock().unwrap()[0]["agenda"], "");
+}
+
+#[test]
+fn local_time_without_a_zone_uses_the_zoom_account_default() {
+    let (k, stub) = setup(reply());
+    issue(&k, &[("start", b"2026-07-30T15:00:00.5")]).unwrap();
+    let seen = stub.seen.lock().unwrap();
+    assert_eq!(seen[0]["start_time"], "2026-07-30T15:00:00.5");
+    assert!(seen[0].get("timezone").is_none());
+}
+
+#[test]
+fn normalization_preserves_fractional_digits_and_crosses_day_boundaries() {
+    for (start, expected) in [
+        ("2026-07-30T22:00:00.5Z", "2026-07-30T22:00:00.5Z"),
+        (
+            "2026-07-30T22:00:00.123456789123-07:00",
+            "2026-07-31T05:00:00.123456789123Z",
+        ),
+        ("2026-07-30T01:00:00+14:00", "2026-07-29T11:00:00Z"),
+        (
+            "2026-07-30T15:00:00.123456789123",
+            "2026-07-30T22:00:00.123456789123Z",
+        ),
+    ] {
+        let (k, stub) = setup(reply());
+        issue(
+            &k,
+            &[
+                ("start", start.as_bytes()),
+                ("timezone", b"America/Los_Angeles"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(stub.seen.lock().unwrap()[0]["start_time"], expected);
+    }
+}
+
+#[test]
+fn response_start_times_use_utc_even_for_a_named_zone() {
+    let mut body = reply();
+    body["start_time"] = json!("2026-07-30T15:00:00-07:00");
+    let (k, _) = setup(body);
+    let result = issue(&k, &[("timezone", b"America/Los_Angeles")]).unwrap();
+    let result: Value = serde_json::from_slice(&result.bytes).unwrap();
+    assert_eq!(result["start_time"], "2026-07-30T22:00:00Z");
+}
+
+#[test]
+fn null_and_empty_passcodes_are_distinguished() {
+    for password in [Value::Null, json!("")] {
+        let mut body = reply();
+        body["password"] = password.clone();
+        let (k, _) = setup(body);
+        let result: Value = serde_json::from_slice(&issue(&k, &[]).unwrap().bytes).unwrap();
+        assert_eq!(result["passcode"], password);
     }
 }
