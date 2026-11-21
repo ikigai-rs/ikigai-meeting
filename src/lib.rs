@@ -564,9 +564,10 @@ impl ZoomBackend {
         for name in self.config.secret_names() {
             let scope = format!("urn:cap:secret:read:{name}");
             if !inv.capability.allows(&scope) {
-                return Err(Error::Denied(format!(
-                    "capability does not allow reading secret `{name}` (needs {scope})"
-                )));
+                return Err(Error::Denied(
+                    format!("capability does not allow reading secret `{name}` (needs {scope})")
+                        .into(),
+                ));
             }
         }
         Ok(())
@@ -920,9 +921,10 @@ fn gate_net(inv: &Invocation<'_>, url: &str) -> Result<()> {
     ) {
         Ok(())
     } else {
-        Err(Error::Denied(format!(
-            "capability does not allow reaching `{host}` (needs urn:cap:net:{host})"
-        )))
+        Err(Error::Denied(
+            format!("capability does not allow reaching `{host}` (needs urn:cap:net:{host})")
+                .into(),
+        ))
     }
 }
 
