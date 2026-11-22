@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Include the provider-returned duration in the shareable calendar graph.
+
 - Validate calendar dates, UTC offsets, and IANA timezones before scheduling. Convert explicit
   instants and unambiguous local times in named zones to UTC, preserving fractional seconds;
   refuse daylight saving gaps and overlaps without an explicit offset.

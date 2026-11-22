@@ -361,3 +361,14 @@ fn null_and_empty_passcodes_are_distinguished() {
         assert_eq!(result["passcode"], password);
     }
 }
+
+#[test]
+fn turtle_carries_the_created_meetings_duration() {
+    let (k, _) = setup(reply());
+    let result = issue(&k, &[("as", b"text/turtle")]).unwrap();
+    let turtle = std::str::from_utf8(&result.bytes).unwrap();
+    assert!(
+        turtle.contains("ical:duration \"PT45M\"^^xsd:duration"),
+        "{turtle}"
+    );
+}
