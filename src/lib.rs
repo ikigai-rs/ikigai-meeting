@@ -1125,8 +1125,12 @@ impl Meeting {
             ));
         }
         s.push_str(&format!(
-            "    ical:dtstart {}^^xsd:dateTime .\n",
+            "    ical:dtstart {}^^xsd:dateTime ;\n",
             ttl_str(&self.start_time)
+        ));
+        s.push_str(&format!(
+            "    ical:duration \"PT{}M\"^^xsd:duration .\n",
+            self.duration
         ));
         s.into_bytes()
     }

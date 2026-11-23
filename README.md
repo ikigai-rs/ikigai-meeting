@@ -24,7 +24,7 @@ meeting's invitees.
 
 - default (`text/plain`) → the **join URL** (what an invite needs)
 - `as=text/turtle` → the **shareable graph** (join-safe: an `ical:Vevent` with `ical:conference`,
-  `dcterms:identifier`, `schema:provider`, the passcode, one `ical:attendee <mailto:…>` per
+  `dcterms:identifier`, `schema:provider`, start time, duration, the passcode, one `ical:attendee <mailto:…>` per
   attendee — the host start URL is deliberately withheld)
 - `as=application/json` → the **full envelope** for the trusted caller, including the host
   `start_url` (which carries a start token)
