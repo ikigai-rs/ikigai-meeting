@@ -1,6 +1,11 @@
-//! The module recipe as one test: `ikigai-conformance` walks the two entries
+//! The module recipe as one test: `ikigai-conformance` walks the three entries
 //! [`ikigai_meeting::space`] binds — the Zoom backend and the scheduling facade,
-//! each with its own description id — and reports every violation at once.
+//! each with its own description id, and the meeting resource `urn:meeting:id:{m}`
+//! (ledger #4519) — and reports every violation at once. The resource is walked
+//! through fixtures naming the stub's one meeting (the suite's `probe` capture is
+//! not a meeting name), and declared live; Delete is fired by no probe, so its
+//! face is pinned by hand
+//! ([`the_meeting_resource_serves_its_declared_faces_and_denies_first`]).
 //!
 //! ## The fixture kernel: a loopback Zoom, and a secret reader that counts
 //!
@@ -141,6 +146,10 @@ const OTHER_SCOPE: &str = "urn:cap:net:example.com";
 
 const TOKEN_PATH: &str = "/oauth/token";
 const MEETINGS_PATH: &str = "/v2/users/me/meetings";
+/// One meeting's path, and the resource that names it.
+const MEETING_PATH: &str = "/v2/meetings/88899900011";
+const MEETING_ID: &str = "meeting-id";
+const MEETING_BINDING: &str = "zoom-88899900011";
 const JOIN_URL: &str = "https://zoom.us/j/88899900011?pwd=abc";
 
 /// One request as the stub received it.
@@ -385,6 +394,25 @@ fn respond(method: &str, path: &str, authorization: &str, request: &[u8]) -> Rep
                 }
             }
         }
+        // One meeting as a resource (ledger #4519): read, update (204, then read) and cancel.
+        ("GET", MEETING_PATH) => json(
+            200,
+            "OK",
+            serde_json::json!({
+                "id":88899900011u64, "type":2, "join_url":JOIN_URL,
+                "start_url":"https://zoom.us/s/88899900011?zak=HOST-SECRET",
+                "password":"a1b2c3", "start_time":"2026-01-01T00:00:00Z",
+                "topic":TOPIC, "duration":30
+            })
+            .to_string(),
+        ),
+        ("PATCH" | "DELETE", MEETING_PATH) => Reply {
+            status: 204,
+            reason: "No Content",
+            content_type: "application/json",
+            headers: Vec::new(),
+            body: Vec::new(),
+        },
         ("POST", "/echo/v2/users/me/meetings") => json(
             400,
             "Bad Request",
@@ -590,7 +618,19 @@ fn conforms() {
         // declaration asserted below): the Sink is held to the
         // failure classes it declares (ledger #1546), and two probes provoke the two an
         // origin answers that a walk cannot: the stub keys them on the topic.
-        .check_failures();
+        .check_failures()
+        // The meeting resource needs a meeting name its grammar admits and, to update, a
+        // change: the suite's `probe` capture is not a meeting name, and is refused as one.
+        .fixture(Fixture::new(MEETING_ID, Verb::Source).binding("m", MEETING_BINDING))
+        .fixture(
+            Fixture::new(MEETING_ID, Verb::Sink)
+                .binding("m", MEETING_BINDING)
+                .arg("topic", TOPIC),
+        )
+        .fixture(Fixture::new(MEETING_ID, Verb::Delete).binding("m", MEETING_BINDING))
+        // A read of a meeting is live: Zoom's copy changes without this module (a host edits
+        // it in Zoom), so no answer is cached, and CACHEABLE holds it to `Expiry::Always`.
+        .live(MEETING_ID);
     for id in IDS {
         suite = suite
             .fails_under(
@@ -610,12 +650,29 @@ fn conforms() {
     // term, and the module's last VOCABULARY finding — is defined by the shared
     // vocabulary as of `ikigai-vocab` 0.1.69.
     assert!(report.is_clean(), "{report}");
-    assert!(report.unprobed.is_empty(), "{report}");
+    // Two things the walk cannot observe, both about the meeting resource and both pinned
+    // by hand: a live read cannot show two calls agree (BODIES), and Delete is fired by no
+    // probe under root, so its face is unobserved (OUTPUTS;
+    // `declared_outputs_are_the_media_types_served` serves it).
+    let unprobed: Vec<(&str, Verb, Check)> = report
+        .unprobed
+        .iter()
+        .map(|u| (u.endpoint.as_str(), u.verb, u.check))
+        .collect();
+    assert_eq!(
+        unprobed,
+        [
+            (MEETING_ID, Verb::Source, Check::Bodies),
+            (MEETING_ID, Verb::Delete, Check::Outputs),
+        ],
+        "{report}"
+    );
 
-    // Two descriptions, two entries, one Sink action each; nothing skipped;
-    // nothing declared but the two opt-ins and the probes.
-    assert_eq!(report.endpoints, IDS.len(), "{report}");
-    assert_eq!(report.actions, ENTRIES.len(), "{report}");
+    // Three descriptions: the two scheduling doors, one Sink action each, and the meeting
+    // resource with Source, Sink and Delete; nothing skipped; nothing declared but the
+    // opt-ins, the fixtures, `live` and the probes.
+    assert_eq!(report.endpoints, IDS.len() + 1, "{report}");
+    assert_eq!(report.actions, ENTRIES.len() + 3, "{report}");
     assert_eq!(
         report.checks.skipped().collect::<Vec<_>>(),
         Vec::<Check>::new(),
@@ -624,6 +681,7 @@ fn conforms() {
     assert!(report.declared.opted_out.is_empty(), "{report}");
     assert!(report.declared.pure.is_empty(), "{report}");
     assert!(report.declared.cacheable.is_empty(), "{report}");
+    assert_eq!(report.declared.live, [MEETING_ID.to_string()], "{report}");
     assert!(report.declared.namespaces.is_empty(), "{report}");
     assert!(report.declared.required_on_mutating, "{report}");
     assert!(report.declared.evidence.check_failures, "{report}");
@@ -652,14 +710,32 @@ fn conforms() {
     // `fails_under` probe fires the Sink once more: a token exchange and a create the
     // stub refuses.
     let firings = 2 * ENTRIES.len() + PROBE_FIRINGS;
-    assert_eq!(stub.hits(TOKEN_PATH), firings, "one token per firing");
+    // The meeting resource, through its fixtures: Source fires twice (the Turtle and the
+    // text face), each a token exchange and a read; Sink fires twice, each a token exchange,
+    // an update and a read of what Zoom then holds. Delete is fired by no probe. The kernel
+    // has no clock, so no token is cached: one exchange per firing.
+    let resource_firings = 4;
+    let resource_calls = 2 + 2 * 2;
+    assert_eq!(
+        stub.hits(TOKEN_PATH),
+        firings + resource_firings,
+        "one token per firing"
+    );
     assert_eq!(stub.hits(MEETINGS_PATH), firings, "one meeting per firing");
-    assert_eq!(stub.connections(), 2 * firings);
-    assert_eq!(secrets.reads(), 3 * firings, "three reads per firing");
+    assert_eq!(stub.hits(MEETING_PATH), resource_calls);
+    assert_eq!(
+        stub.connections(),
+        2 * firings + resource_firings + resource_calls
+    );
+    assert_eq!(
+        secrets.reads(),
+        3 * (firings + resource_firings),
+        "three reads per firing"
+    );
     for r in stub.received() {
         let path = r.path.split('?').next().unwrap_or(&r.path);
         assert!(
-            path == TOKEN_PATH || path == MEETINGS_PATH,
+            path == TOKEN_PATH || path == MEETINGS_PATH || path == MEETING_PATH,
             "an unscripted route was requested: {}",
             r.path
         );
@@ -678,7 +754,7 @@ fn the_ids_are_kebab_case_nouns() {
     eprintln!("{report}");
     assert_eq!(report.of(Check::Names).count(), 0, "{report}");
     assert!(report.is_clean(), "{report}");
-    assert_eq!(report.endpoints, IDS.len(), "{report}");
+    assert_eq!(report.endpoints, IDS.len() + 1, "{report}");
     assert_eq!(stub.connections(), 0, "NAMES is a static check");
 }
 
@@ -833,6 +909,94 @@ fn declared_outputs_are_the_media_types_served() {
         "{err:?}"
     );
     assert_eq!(stub.connections(), before, "refused before any socket");
+}
+
+/// The meeting resource over the loopback stub (ledger #4519): each action's declared faces
+/// are the faces it serves, including Delete's, which no suite probe fires; the host link is
+/// in the JSON face only for the presenter; and under a grant short of the whole one, every
+/// action refuses with a typed `Denied` before the reader is asked or a socket opens.
+#[test]
+fn the_meeting_resource_serves_its_declared_faces_and_denies_first() {
+    let stub = Stub::start();
+    let secrets = Arc::new(Secrets::default());
+    let kernel = kernel(&stub, secrets.clone(), "/v2");
+    let name = format!("urn:meeting:id:{MEETING_BINDING}");
+    let spec = kernel
+        .describe_pattern(&name)
+        .expect("the meeting resource describes itself");
+    let outputs = |verb: Verb| -> Vec<String> {
+        spec.action_specs()
+            .into_iter()
+            .find(|a| a.verb == verb)
+            .unwrap_or_else(|| panic!("{verb:?} is declared"))
+            .outputs
+            .iter()
+            .map(|o| ikigai_conformance::rdf::bare_media_type(o))
+            .collect()
+    };
+    let call = |verb: Verb, args: &[(&str, &str)], cap: &Capability| {
+        let mut request = Request::new(verb, Iri::parse(&name).unwrap());
+        for (k, v) in args {
+            request = request.with_arg(*k, ArgRef::Inline(v.as_bytes().to_vec()));
+        }
+        futures::executor::block_on(kernel.issue(request, cap))
+    };
+
+    // Denied first: the stub's host without the credential names, and the credential names
+    // without the stub's host.
+    let mut no_net = secret_grants();
+    no_net.push(OTHER_SCOPE);
+    for cap in [
+        scoped(&[STUB_SCOPE, "urn:cap:secret:read:other"]),
+        scoped(&no_net),
+    ] {
+        for verb in [Verb::Source, Verb::Sink, Verb::Delete] {
+            let err = call(verb, &[("topic", "t")], &cap).unwrap_err();
+            assert!(matches!(err, Error::Denied(_)), "{verb:?}: {err:?}");
+            assert_eq!(err.class(), FailureClass::Denied);
+        }
+    }
+    assert_eq!(stub.connections(), 0, "no socket before the grant");
+    assert_eq!(secrets.reads(), 0, "no secret before the grant");
+
+    let root = Capability::root();
+    assert_eq!(outputs(Verb::Source), FACES);
+    assert_eq!(outputs(Verb::Sink), FACES);
+    for face in FACES {
+        for (verb, args) in [
+            (Verb::Source, vec![("as", face)]),
+            (Verb::Sink, vec![("as", face), ("topic", TOPIC)]),
+        ] {
+            let repr = call(verb, &args, &root).unwrap_or_else(|e| panic!("{verb:?} {face}: {e}"));
+            assert_eq!(
+                ikigai_conformance::rdf::bare_media_type(&repr.repr_type.media_type),
+                face
+            );
+        }
+    }
+    let json = |cap: &Capability| -> serde_json::Value {
+        serde_json::from_slice(
+            &call(Verb::Source, &[("as", "application/json")], cap)
+                .unwrap()
+                .bytes,
+        )
+        .unwrap()
+    };
+    assert!(json(&root)["start_url"].as_str().unwrap().contains("zak="));
+    let learner = json(&full_grant());
+    assert!(learner.get("start_url").is_none(), "{learner}");
+    assert_eq!(learner["meeting"], name.as_str());
+
+    assert_eq!(outputs(Verb::Delete), [FACES[0]]);
+    let cancelled = call(Verb::Delete, &[], &root).expect("cancels");
+    assert_eq!(
+        ikigai_conformance::rdf::bare_media_type(&cancelled.repr_type.media_type),
+        FACES[0]
+    );
+    assert_eq!(
+        String::from_utf8(cancelled.bytes).unwrap(),
+        format!("Cancelled meeting {name}.")
+    );
 }
 
 /// The errors this module composes never carry a credential or the request's
@@ -1087,7 +1251,12 @@ fn the_turtle_and_json_faces_are_term_equal() {
                 .as_str()
                 .unwrap_or_else(|| panic!("the JSON face has no string `{name}`: {json}"))
         };
-        let subject = NamedNode::new(format!("urn:meeting:zoom:{}", field("id"))).unwrap();
+        // The subject is the meeting's resource name, the one `urn:meeting:id:{m}` serves.
+        assert_eq!(
+            field("meeting"),
+            format!("urn:meeting:id:zoom-{}", field("id"))
+        );
+        let subject = NamedNode::new(field("meeting")).unwrap();
         let objects = |predicate: &str| -> Vec<Term> {
             triples
                 .iter()
@@ -1161,7 +1330,9 @@ fn attendees_reach_zoom_as_meeting_invitees() {
         ]),
         "{settings}"
     );
-    assert_eq!(settings["join_before_host"], true, "{settings}");
+    // The settings are arguments with safe defaults (ledger #4519), no longer hard-coded.
+    assert_eq!(settings["join_before_host"], false, "{settings}");
+    assert_eq!(settings["waiting_room"], true, "{settings}");
     let none = settings_sent(&[("topic", "t"), ("start", "2026-01-01T00:00:00Z")]);
     assert!(
         none.get("meeting_invitees").is_none(),

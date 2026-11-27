@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Changed (BREAKING: needs a minor release, not a patch)
+
+- **A meeting is a resource** (ledger #4519): `urn:meeting:id:{m}` (id `meeting-id`), where `{m}`
+  is `zoom-<Zoom meeting id>`. Source reads the meeting from Zoom, Sink sends only the changes
+  given and answers the meeting Zoom then holds, and Delete cancels it. An unknown or cancelled
+  meeting is `NotFound`; a malformed `{m}` is an `InvalidArgument` naming `m`. Reads are never
+  cached.
+- **Meeting settings are arguments**: `waiting_room` (default `true`), `join_before_host`
+  (default `false`), `authenticated_join` (default `false`, Zoom's `meeting_authentication`) and
+  `auto_recording` (`none`, `local` or `cloud`; default `none`). Before, every meeting was
+  created with `join_before_host: true` and `waiting_room: false`, and no argument could change
+  that. `captions` is declared and refused with `Unsupported`: Zoom has no per-meeting captions
+  setting.
+- **Per-teacher accounts**: `teacher=<t>` acts in teacher `t`'s account, from the keystore
+  record `zoom-teacher-<t>`: a Zoom `user_id` the shared Server-to-Server app acts for, or the
+  teacher's own user-level OAuth app (client id, client secret, refresh token). The rotated
+  refresh token is stored back through the new `SecretReader::store`, whose default refuses.
+  `ZoomConfig` gains `teacher_secret_prefix`, so a struct literal without `..Default::default()`
+  no longer compiles.
+- **The host link is sealed to the presenter**: the JSON face carries `start_url` only for a
+  caller holding `urn:cap:meeting:host:id:{m}` or, with `teacher=<t>`, `urn:cap:meeting:host:teacher:{t}`
+  (root holds both). Before, every caller of the JSON face got it.
+- **The graph's subject is the meeting's resource name**: `<urn:meeting:id:zoom-<id>>` in place
+  of `<urn:meeting:zoom:<id>>`, and the JSON face gains `meeting`, the same name.
+- Every schedule is one scheduled meeting (`type: 2`), never a recurring series.
+
 - Include the provider-returned duration in the shareable calendar graph.
 
 - Validate calendar dates, UTC offsets, and IANA timezones before scheduling. Convert explicit
