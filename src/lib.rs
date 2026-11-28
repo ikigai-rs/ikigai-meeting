@@ -6,6 +6,19 @@
 //! `ical:conference` (RFC 7986's CONFERENCE property), so ONE value flows into the `.ics`, the
 //! calendar event, and — later — an org entry, without re-plumbing at each destination.
 //!
+//! ## A meeting is a resource
+//!
+//! `urn:meeting:id:{m}` is one meeting: Source reads it, Sink moves or changes it (only what is
+//! given is sent), Delete cancels it. `{m}` names the provider and its id (`zoom-88899900011`),
+//! so the name stays provider-neutral. Every schedule makes one meeting, never a provider's
+//! recurring series. The settings (waiting room, joining before the host, authenticated join,
+//! auto-recording) are arguments with stated defaults, never hard-coded. `teacher=<t>` acts in
+//! that teacher's account, from their record in the keystore. The host link (`start_url`) is
+//! sealed to the presenter: [`CAP_HOST_MEETING`] or [`CAP_HOST_TEACHER`].
+//! Only the meeting's host's account reaches it: an update, a cancel, or a read naming a
+//! teacher is [`Error::Denied`] unless the Zoom user the account acts for is the meeting's
+//! `host_id`, so one teacher's grants never reach another teacher's meeting.
+//!
 //! ## Injection, not dependencies
 //!
 //! Like ikigai-llm, this crate bakes in no HTTP client and no keystore. The host injects:
@@ -66,8 +79,8 @@
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDateTime, SecondsFormat, TimeZone, Utc};
 use ikigai_core::{
-    ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, FailureClass, Invocation,
-    ReprType, Representation, Result, Time, Verb,
+    ActionSpec, ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, FailureClass,
+    Invocation, ReprType, Representation, Result, Time, UriTemplate, Verb,
 };
 use ikigai_http::status::{response_error, transport_error};
 use ikigai_http::{HttpBody, HttpRequest, HttpResponse, HttpTransport, Method};
@@ -90,6 +103,18 @@ pub const FACES: [&str; 3] = ["text/plain", "text/turtle", "application/json"];
 /// Stable description ids and catalog labels for the two scheduling doors.
 const ZOOM_ID: &str = "meeting-zoom-schedule";
 const FACADE_ID: &str = "meeting-schedule";
+/// The description id and catalog label of `urn:meeting:id:{m}`.
+const MEETING_ID: &str = "meeting-id";
+
+/// One meeting as a resource. `{m}` names the provider and its id: `zoom-88899900011`.
+pub const MEETING_TEMPLATE: &str = "urn:meeting:id:{m}";
+const MEETING_PREFIX: &str = "urn:meeting:id:";
+
+/// The presenter's grant for one meeting's host link: `urn:cap:meeting:host:id:{m}`.
+pub const CAP_HOST_MEETING: &str = "urn:cap:meeting:host:id:";
+/// The presenter's grant for the host links of every meeting in one teacher's account:
+/// `urn:cap:meeting:host:teacher:{t}`.
+pub const CAP_HOST_TEACHER: &str = "urn:cap:meeting:host:teacher:";
 
 /// The meeting length when `duration` is not given, in minutes.
 pub const DEFAULT_MINUTES: u32 = 30;
@@ -101,6 +126,7 @@ pub const TOKEN_REFRESH_MARGIN_SECS: u64 = 60;
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 const XSD_DATETIME: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
 const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
+const XSD_BOOLEAN: &str = "http://www.w3.org/2001/XMLSchema#boolean";
 
 /// What a credential value becomes in any error text this module composes from foreign text.
 const REDACTED: &str = "[redacted]";
@@ -117,6 +143,19 @@ const MAX_ZOOM_BODY: usize = 1024 * 1024;
 pub trait SecretReader: Send + Sync {
     /// The secret's bytes, or `Error::Denied`/`Error::Endpoint` if the host refuses or can't read.
     fn read(&self, name: &str) -> Result<Vec<u8>>;
+
+    /// Replace a secret's bytes. Only a teacher record for a user-level OAuth app is ever
+    /// stored: Zoom answers each refresh with a new refresh token, and the next refresh must
+    /// use it. The module checks `urn:cap:secret:write:<name>` before it asks. The default
+    /// refuses with [`Error::Unsupported`], so a read-only keystore keeps working for every
+    /// Server-to-Server account.
+    fn store(&self, name: &str, value: &[u8]) -> Result<()> {
+        let _ = value;
+        Err(Error::Unsupported {
+            verb: None,
+            detail: format!("this keystore cannot store secret `{name}`"),
+        })
+    }
 }
 
 /// Which secrets hold the Zoom Server-to-Server OAuth credentials, and where the API lives.
@@ -134,6 +173,9 @@ pub struct ZoomConfig {
     pub oauth_base: String,
     /// REST API base (`https://api.zoom.us/v2`).
     pub api_base: String,
+    /// The prefix of each teacher's record in the keystore: teacher `t`'s record is the
+    /// secret `{teacher_secret_prefix}{t}` (`zoom-teacher-t` by default). See [`space`].
+    pub teacher_secret_prefix: String,
 }
 
 impl Default for ZoomConfig {
@@ -145,12 +187,13 @@ impl Default for ZoomConfig {
             user_id: "me".to_string(),
             oauth_base: "https://zoom.us".to_string(),
             api_base: "https://api.zoom.us/v2".to_string(),
+            teacher_secret_prefix: "zoom-teacher-".to_string(),
         }
     }
 }
 
 impl ZoomConfig {
-    /// The three credential names, in the order they are read.
+    /// The three shared Server-to-Server credential names, in the order they are read.
     fn secret_names(&self) -> [&str; 3] {
         [
             &self.account_id_secret,
@@ -165,13 +208,28 @@ impl ZoomConfig {
         format!("{}/oauth/token", self.oauth_base.trim_end_matches('/'))
     }
 
-    /// The create-meeting endpoint for the configured user.
-    fn meetings_url(&self) -> String {
+    /// The create-meeting endpoint for a user: a path segment, already encoded.
+    fn meetings_url(&self, user: &str) -> String {
         format!(
-            "{}/users/{}/meetings",
-            self.api_base.trim_end_matches('/'),
-            self.user_id
+            "{}/users/{user}/meetings",
+            self.api_base.trim_end_matches('/')
         )
+    }
+
+    /// One user's endpoint, for the Zoom user id an account acts for: a path segment, already
+    /// encoded, or `me`.
+    fn user_url(&self, user: &str) -> String {
+        format!("{}/users/{user}", self.api_base.trim_end_matches('/'))
+    }
+
+    /// One meeting's endpoint (read, update, cancel), by Zoom's numeric id.
+    fn meeting_url(&self, id: &str) -> String {
+        format!("{}/meetings/{id}", self.api_base.trim_end_matches('/'))
+    }
+
+    /// The keystore name of teacher `t`'s record.
+    fn teacher_secret(&self, teacher: &str) -> String {
+        format!("{}{teacher}", self.teacher_secret_prefix)
     }
 }
 
@@ -238,32 +296,74 @@ pub fn space(
     secrets: Arc<dyn SecretReader>,
     config: ZoomConfig,
 ) -> EndpointSpace {
-    let zoom = ZoomBackend {
-        id: ZOOM_ID,
+    let zoom = Arc::new(Zoom {
         transport,
         secrets,
         config,
         tokens: Arc::default(),
-    };
-    let facade = ZoomBackend {
-        id: FACADE_ID,
-        ..zoom.clone()
-    };
+        refreshing: RefreshLocks::default(),
+    });
     EndpointSpace::new()
-        .bind(Exact::new("urn:meeting:zoom:schedule"), zoom)
-        .bind(Exact::new("urn:meeting:schedule"), facade)
+        .bind(
+            Exact::new("urn:meeting:zoom:schedule"),
+            ZoomBackend {
+                id: ZOOM_ID,
+                zoom: zoom.clone(),
+            },
+        )
+        .bind(
+            Exact::new("urn:meeting:schedule"),
+            ZoomBackend {
+                id: FACADE_ID,
+                zoom: zoom.clone(),
+            },
+        )
+        .bind(
+            UriTemplate::parse(MEETING_TEMPLATE).expect("a valid template"),
+            MeetingById { zoom },
+        )
 }
 
-/// The Zoom backend: exchange the S2S credentials for a bearer token, then create a scheduled
-/// meeting. Cloneable so the facade and the backend can share one configuration and one
+/// The Zoom backend's scheduling door: exchange the credentials for a bearer token, then create
+/// a scheduled meeting. Cloneable; every door of one [`space`] shares one configuration and one
 /// token cache.
 #[derive(Clone)]
 pub struct ZoomBackend {
     id: &'static str,
+    zoom: Arc<Zoom>,
+}
+
+/// `urn:meeting:id:{m}`: one meeting as a resource. Source reads it, Sink updates it, Delete
+/// cancels it. `{m}` is provider-neutral and names its provider: `zoom-<Zoom's meeting id>`.
+#[derive(Clone)]
+pub struct MeetingById {
+    zoom: Arc<Zoom>,
+}
+
+/// What every door shares: the injected transport and keystore, the configuration, the cache.
+struct Zoom {
     transport: Arc<dyn HttpTransport>,
     secrets: Arc<dyn SecretReader>,
     config: ZoomConfig,
     tokens: Arc<TokenCache>,
+    refreshing: RefreshLocks,
+}
+
+/// One async lock per teacher record with its own app. Zoom rotates the refresh token on every
+/// refresh and refuses the old one, so two refreshes for one teacher must not both start from
+/// the same token: the second waits, then starts from the record the first stored.
+#[derive(Default)]
+struct RefreshLocks(Mutex<HashMap<String, Arc<futures_util::lock::Mutex<()>>>>);
+
+impl RefreshLocks {
+    fn for_record(&self, record: &str) -> Arc<futures_util::lock::Mutex<()>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(record.to_string())
+            .or_default()
+            .clone()
+    }
 }
 
 /// One meeting as the caller asked for it — the validated inputs.
@@ -274,26 +374,82 @@ struct MeetingRequest {
     timezone: Option<String>,
     agenda: Option<String>,
     attendees: Vec<String>,
+    settings: Settings,
+}
+
+/// The meeting settings a caller may choose. `None` is "not given": a new meeting takes the
+/// default ([`Settings::or_defaults`]); an update leaves Zoom's value as it is.
+#[derive(Clone, Default, Debug, PartialEq)]
+struct Settings {
+    waiting_room: Option<bool>,
+    join_before_host: Option<bool>,
+    authenticated_join: Option<bool>,
+    auto_recording: Option<String>,
+}
+
+/// The values `auto_recording` takes, Zoom's own words; the first is the default.
+pub const AUTO_RECORDING: [&str; 3] = ["none", "local", "cloud"];
+
+impl Settings {
+    /// The settings given as arguments, each held to its type. There is no `captions`: Zoom's
+    /// meeting API has no per-meeting captions field (captions are an account or user setting),
+    /// so an argument for them could never be honored.
+    fn parse(inv: &Invocation<'_>) -> Result<Settings> {
+        let auto_recording = match optional(inv, "auto_recording")? {
+            None => None,
+            Some(value) if AUTO_RECORDING.contains(&value.as_str()) => Some(value),
+            Some(_) => return Err(invalid("auto_recording", "not one of none, local, cloud")),
+        };
+        Ok(Settings {
+            waiting_room: boolean(inv, "waiting_room")?,
+            join_before_host: boolean(inv, "join_before_host")?,
+            authenticated_join: boolean(inv, "authenticated_join")?,
+            auto_recording,
+        })
+    }
+
+    /// A new meeting's settings: the waiting room on, joining before the host off, any Zoom
+    /// user may join, and no recording, unless the caller chose otherwise.
+    fn or_defaults(self) -> Settings {
+        Settings {
+            waiting_room: Some(self.waiting_room.unwrap_or(true)),
+            join_before_host: Some(self.join_before_host.unwrap_or(false)),
+            authenticated_join: Some(self.authenticated_join.unwrap_or(false)),
+            auto_recording: Some(
+                self.auto_recording
+                    .unwrap_or_else(|| AUTO_RECORDING[0].to_string()),
+            ),
+        }
+    }
+
+    /// Zoom's `settings` object: the given settings and nothing else.
+    fn json(&self) -> serde_json::Map<String, Value> {
+        let mut out = serde_json::Map::new();
+        if let Some(on) = self.waiting_room {
+            out.insert("waiting_room".into(), json!(on));
+        }
+        if let Some(on) = self.join_before_host {
+            out.insert("join_before_host".into(), json!(on));
+        }
+        if let Some(on) = self.authenticated_join {
+            out.insert("meeting_authentication".into(), json!(on));
+        }
+        if let Some(mode) = &self.auto_recording {
+            out.insert("auto_recording".into(), json!(mode));
+        }
+        out
+    }
 }
 
 /// Which token a cached entry is: the endpoint that minted it and the account and client it was
 /// minted for. The client secret is not part of it: a token minted before a rotation is still the
-/// account's token, and if Zoom refuses it the `401` path drops it.
+/// account's token, and if Zoom refuses it the `401` path drops it. A teacher's own app is keyed
+/// by its record's name in place of an account id.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct TokenKey {
     token_url: String,
     account_id: String,
     client_id: String,
-}
-
-impl TokenKey {
-    fn of(token_url: &str, creds: &Credentials) -> TokenKey {
-        TokenKey {
-            token_url: token_url.to_string(),
-            account_id: creds.account_id.clone(),
-            client_id: creds.client_id.clone(),
-        }
-    }
 }
 
 /// A minted token and the instant (milliseconds, the invocation's clock) it stops being used.
@@ -347,18 +503,128 @@ impl TokenCache {
     }
 }
 
-/// What a create-meeting call came back with: the meeting, or a `401` for a token the cache
-/// supplied, which the caller answers by minting a fresh one and trying once more.
-enum Created {
-    Meeting(Meeting),
-    TokenRefused,
-}
-
-/// The three S2S credentials, read from the keystore.
+/// The three shared S2S credentials, read from the keystore.
 struct Credentials {
     account_id: String,
     client_id: String,
     client_secret: String,
+}
+
+/// A teacher's own user-level OAuth app, from their record. The refresh token changes when Zoom
+/// rotates it, so it sits behind a lock: a second refresh in one call uses the new one.
+struct OwnApp {
+    record: String,
+    fields: serde_json::Map<String, Value>,
+    client_id: String,
+    client_secret: String,
+    refresh_token: Mutex<String>,
+}
+
+/// How an account's token is obtained.
+enum Grant {
+    /// The shared Server-to-Server app, acting for a user in its account.
+    Shared(Credentials),
+    /// A teacher's own user-level OAuth app.
+    Own(OwnApp),
+}
+
+/// The account a call acts in, the API URL it calls and the user it acts for, all already
+/// authorized.
+struct Account {
+    grant: Grant,
+    url: String,
+    /// `GET` this for the Zoom user the account acts for: its `id` must be a meeting's
+    /// `host_id` before the meeting is changed, canceled or its host details read.
+    user_url: String,
+    /// Who the call acts for, in a refusal's words: the teacher, or the configured user.
+    acting: String,
+}
+
+impl Account {
+    fn key(&self, token_url: &str) -> TokenKey {
+        match &self.grant {
+            Grant::Shared(creds) => TokenKey {
+                token_url: token_url.to_string(),
+                account_id: creds.account_id.clone(),
+                client_id: creds.client_id.clone(),
+            },
+            Grant::Own(app) => TokenKey {
+                token_url: token_url.to_string(),
+                account_id: format!("record:{}", app.record),
+                client_id: app.client_id.clone(),
+            },
+        }
+    }
+
+    /// Every credential value, for [`scrub`].
+    fn secrets(&self) -> Vec<String> {
+        match &self.grant {
+            Grant::Shared(c) => vec![
+                c.account_id.clone(),
+                c.client_id.clone(),
+                c.client_secret.clone(),
+            ],
+            Grant::Own(app) => vec![
+                app.client_id.clone(),
+                app.client_secret.clone(),
+                app.refresh_token
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+            ],
+        }
+    }
+}
+
+/// What a call reaches: the create-meeting endpoint of the account's user, or one meeting.
+enum Target<'a> {
+    Create,
+    Meeting(&'a str),
+}
+
+/// One call against a meeting.
+///
+/// Every call on an existing meeting except a read without a teacher first proves the account
+/// hosts it: the account's user `id` must be the meeting's `host_id`. Otherwise one teacher's
+/// grants would reach another teacher's meeting through the shared account's token.
+enum Call<'a> {
+    Create(&'a MeetingRequest),
+    /// A read; `host_only` when a teacher is named, so their host link is theirs.
+    Get {
+        host_only: bool,
+    },
+    Update(&'a Value),
+    Cancel,
+}
+
+impl Call<'_> {
+    fn what(&self) -> &'static str {
+        match self {
+            Call::Create(_) => "create-meeting",
+            Call::Get { .. } => "get-meeting",
+            Call::Update(_) => "update-meeting",
+            Call::Cancel => "cancel-meeting",
+        }
+    }
+}
+
+/// What a call came back with: the meeting, a cancelation, or a `401` for a token the cache
+/// supplied, which the caller answers by minting a fresh one and trying once more.
+enum Outcome {
+    Meeting(Meeting),
+    Canceled,
+    TokenRefused,
+}
+
+impl Outcome {
+    fn into_meeting(self) -> Result<Meeting> {
+        match self {
+            Outcome::Meeting(meeting) => Ok(meeting),
+            _ => Err(Error::Endpoint(
+                "zoom: the call answered no meeting".to_string(),
+            )),
+        }
+    }
 }
 
 #[async_trait]
@@ -368,61 +634,20 @@ impl Endpoint for ZoomBackend {
         // `InvalidArgument` that names the input and never echoes the value.
         let topic = required(inv, "topic")?;
         let start = required(inv, "start")?.trim().to_string();
-        let timezone = optional(inv, "timezone")?;
-        let zone = timezone
-            .as_deref()
-            .map(|name| {
-                name.parse::<chrono_tz::Tz>()
-                    .map_err(|_| invalid("timezone", "not a recognized IANA time zone"))
-            })
-            .transpose()?;
-        if !is_xsd_datetime(&start) {
-            return Err(invalid(
-                "start",
-                "not an xsd:dateTime (YYYY-MM-DDThh:mm:ss, optionally .fff and Z or ±hh:mm)",
-            ));
-        }
-        let start = normalize_start(&start, zone)?;
-        let duration = match optional(inv, "duration")? {
-            None => DEFAULT_MINUTES,
-            Some(minutes) => match minutes.parse::<u32>() {
-                Ok(n) if (1..=1440).contains(&n) => n,
-                _ => {
-                    return Err(invalid(
-                        "duration",
-                        "not a positive xsd:integer of minutes, at most one day",
-                    ))
-                }
-            },
-        };
-        let attendees = match optional(inv, "attendees")? {
-            None => Vec::new(),
-            Some(list) => parse_attendees(&list).ok_or_else(|| {
-                invalid(
-                    "attendees",
-                    "not a list of email addresses (separated by commas, semicolons or whitespace)",
-                )
-            })?,
-        };
+        let (timezone, zone) = timezone_arg(inv)?;
+        let start = start_value(&start, zone)?;
+        let duration = duration_arg(inv)?.unwrap_or(DEFAULT_MINUTES);
+        let attendees = attendees_arg(inv)?.unwrap_or_default();
         // Pipeline citizenship: a named `agenda` wins; the piped `content` is the fallback.
         let agenda = optional(inv, "agenda")?;
         let content = optional(inv, "content")?;
         let agenda = agenda.or(content);
-        let face = optional(inv, "as")?.unwrap_or_else(|| FACES[0].to_string());
-        if !FACES.contains(&face.as_str()) {
-            return Err(invalid(
-                "as",
-                "not one of text/plain, text/turtle, application/json",
-            ));
-        }
+        let face = face_arg(inv)?;
+        let settings = Settings::parse(inv)?.or_defaults();
+        let teacher = teacher_arg(inv)?;
 
         // Authority first: a typed `Denied` before any secret is read or any socket opens.
-        let token_url = self.config.token_url();
-        let meetings_url = self.config.meetings_url();
-        self.authorize(inv, &[&token_url, &meetings_url])?;
-
-        // Credentials the host resolved from the keystore.
-        let creds = self.credentials()?;
+        let account = self.zoom.account(inv, teacher.as_deref(), Target::Create)?;
         let request = MeetingRequest {
             topic,
             start,
@@ -430,43 +655,15 @@ impl Endpoint for ZoomBackend {
             timezone,
             agenda,
             attendees,
+            settings,
         };
-        // The token: a cached one while the invocation's clock says it is still good, else a
-        // fresh one (kept when there is a clock to judge it by). The same clock measures a
-        // `Retry-After` given as an HTTP-date.
-        let now = inv.now();
-        let key = TokenKey::of(&token_url, &creds);
-        let cached = now.and_then(|now| self.tokens.get(&key, now.as_millis()));
-        let meeting = match cached {
-            Some(token) => match self
-                .create_meeting(&meetings_url, &token, &creds, &request, true, now)
-                .await?
-            {
-                Created::Meeting(meeting) => meeting,
-                Created::TokenRefused => {
-                    self.tokens.evict(&key, &token);
-                    let token = self.fresh_token(&token_url, &creds, &key, now).await?;
-                    self.create_meeting(&meetings_url, &token, &creds, &request, false, now)
-                        .await?
-                        .into_meeting()?
-                }
-            },
-            None => {
-                let token = self.fresh_token(&token_url, &creds, &key, now).await?;
-                self.create_meeting(&meetings_url, &token, &creds, &request, false, now)
-                    .await?
-                    .into_meeting()?
-            }
-        };
-
-        // Faces: default text/plain = the join URL (what the invite needs); `as=text/turtle` = the
-        // SHAREABLE graph (join-safe, `ical:conference`); `as=application/json` = the full envelope
-        // for the trusted caller, INCLUDING the host `start_url` (a URL that carries a host token).
-        Ok(match face.as_str() {
-            "text/turtle" => repr("text/turtle", meeting.turtle()),
-            "application/json" => repr("application/json", meeting.json_envelope()),
-            _ => repr("text/plain", meeting.join_url.into_bytes()),
-        })
+        let meeting = self
+            .zoom
+            .run(inv, &account, &Call::Create(&request))
+            .await?
+            .into_meeting()?;
+        let host = may_host(inv, &meeting, teacher.as_deref());
+        Ok(meeting.face(&face, host))
     }
 
     // Each door has its own published id; the catalog and description must agree.
@@ -475,11 +672,12 @@ impl Endpoint for ZoomBackend {
     }
 
     fn describe(&self) -> Description {
-        Description::new(self.id)
+        let mut description = Description::new(self.id)
             .summary(
-                "Schedule a Zoom meeting. Returns the join URL (text), the shareable graph \
-                 (as=text/turtle — ical:conference), or the full envelope (as=application/json, \
-                 which includes the host start URL). A piped value is the agenda.",
+                "Schedule one Zoom meeting (never a recurring series). Returns the join URL \
+                 (text), the shareable graph (as=text/turtle — ical:conference), or the full \
+                 envelope (as=application/json; the host start URL only for the presenter). \
+                 A piped value is the agenda.",
             )
             .verb(Verb::Sink)
             .requires(CAP_NET)
@@ -489,56 +687,22 @@ impl Endpoint for ZoomBackend {
                     .summary("the meeting title")
                     .class(XSD_STRING),
             )
+            .input(start_spec())
             .input(
-                ArgSpec::new("start")
-                    .summary(
-                        "start time: RFC 3339 with an offset, or local time with `timezone`; \
-                         DST gaps and overlaps require an offset; answers use UTC",
-                    )
-                    .class(XSD_DATETIME),
-            )
-            .input(
-                ArgSpec::new("duration")
-                    .summary("length in minutes, an integer from 1 through 1440 (default 30)")
-                    .class(XSD_INTEGER)
+                duration_spec()
                     .default_value(DEFAULT_MINUTES.to_string())
                     .optional(),
             )
-            .input(
-                ArgSpec::new("timezone")
-                    .summary("IANA zone for local start times (e.g. America/Los_Angeles); omitted uses the Zoom account zone")
-                    .class(XSD_STRING)
-                    .optional(),
-            )
-            .input(
-                ArgSpec::new("attendees")
-                    .summary(
-                        "who the meeting is for: email addresses, separated by commas, semicolons \
-                         or whitespace (Zoom's meeting invitees; ical:attendee in the graph)",
-                    )
-                    .class(XSD_STRING)
-                    .optional(),
-            )
-            .input(
-                ArgSpec::new("agenda")
-                    .summary("a longer description")
-                    .class(XSD_STRING)
-                    .optional(),
-            )
-            .input(
-                ArgSpec::new("content")
-                    .summary("the agenda, when piped or given as the sink's body — a named `agenda` wins")
-                    .class(XSD_STRING)
-                    .optional(),
-            )
-            .input(
-                ArgSpec::new("as")
-                    .summary("the face: the join URL, the shareable graph, or the full envelope")
-                    .class(XSD_STRING)
-                    .one_of(FACES)
-                    .default_value(FACES[0])
-                    .optional(),
-            )
+            .input(timezone_spec())
+            .input(attendees_spec())
+            .input(agenda_spec())
+            .input(content_spec());
+        for spec in setting_specs(true) {
+            description = description.input(spec);
+        }
+        description
+            .input(teacher_spec())
+            .input(face_spec())
             .output(FACES[0])
             .output(FACES[1])
             .output(FACES[2])
@@ -554,26 +718,273 @@ impl Endpoint for ZoomBackend {
     }
 }
 
-impl ZoomBackend {
-    /// The module's own rules, checked before anything else: every URL's host must be granted
-    /// (port-aware), and every credential name must be readable. Root passes both.
-    fn authorize(&self, inv: &Invocation<'_>, urls: &[&str]) -> Result<()> {
-        for url in urls {
-            gate_net(inv, url)?;
-        }
-        for name in self.config.secret_names() {
-            let scope = format!("urn:cap:secret:read:{name}");
-            if !inv.capability.allows(&scope) {
-                return Err(Error::Denied(
-                    format!("capability does not allow reading secret `{name}` (needs {scope})")
-                        .into(),
-                ));
+#[async_trait]
+impl Endpoint for MeetingById {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let m = meeting_name(inv)?;
+        match inv.request.verb {
+            Verb::Source => {
+                let face = face_arg(inv)?;
+                let teacher = teacher_arg(inv)?;
+                let account = self
+                    .zoom
+                    .account(inv, teacher.as_deref(), Target::Meeting(&m))?;
+                let meeting = self
+                    .zoom
+                    .run(
+                        inv,
+                        &account,
+                        &Call::Get {
+                            host_only: teacher.is_some(),
+                        },
+                    )
+                    .await?
+                    .into_meeting()?;
+                let host = may_host(inv, &meeting, teacher.as_deref());
+                Ok(meeting.face(&face, host))
             }
+            Verb::Sink => {
+                let topic = match inv.inline_str("topic") {
+                    Ok(topic) if topic.trim().is_empty() => {
+                        return Err(invalid("topic", "empty; a meeting needs a title"))
+                    }
+                    Ok(topic) => Some(topic.to_string()),
+                    Err(Error::MissingArgument(_)) => None,
+                    Err(_) => return Err(invalid("topic", "expected an inline UTF-8 value")),
+                };
+                let start = optional(inv, "start")?;
+                let (timezone, zone) = timezone_arg(inv)?;
+                let start = start.map(|s| start_value(&s, zone)).transpose()?;
+                let duration = duration_arg(inv)?;
+                let attendees = attendees_arg(inv)?;
+                let agenda = optional(inv, "agenda")?;
+                let content = optional(inv, "content")?;
+                let agenda = agenda.or(content);
+                let face = face_arg(inv)?;
+                let settings = Settings::parse(inv)?;
+                let teacher = teacher_arg(inv)?;
+
+                // What changed, and nothing else: an update never resets a setting it was not
+                // given, and never makes the meeting anything but one scheduled meeting.
+                let mut body = serde_json::Map::new();
+                if let Some(topic) = topic {
+                    body.insert("topic".into(), json!(topic));
+                }
+                if let Some(start) = start {
+                    body.insert("start_time".into(), json!(start));
+                }
+                if let Some(duration) = duration {
+                    body.insert("duration".into(), json!(duration));
+                }
+                if let Some(timezone) = timezone {
+                    body.insert("timezone".into(), json!(timezone));
+                }
+                if let Some(agenda) = agenda {
+                    body.insert("agenda".into(), json!(agenda));
+                }
+                let mut zoom_settings = settings.json();
+                if let Some(attendees) = attendees {
+                    zoom_settings.insert("meeting_invitees".into(), invitees(&attendees));
+                }
+                if !zoom_settings.is_empty() {
+                    body.insert("settings".into(), Value::Object(zoom_settings));
+                }
+                if body.is_empty() {
+                    return Err(Error::MissingArgument(
+                        "something to change: topic, start, duration, timezone, agenda, \
+                         attendees, waiting_room, join_before_host, authenticated_join or \
+                         auto_recording"
+                            .to_string(),
+                    ));
+                }
+                let body = Value::Object(body);
+                let account = self
+                    .zoom
+                    .account(inv, teacher.as_deref(), Target::Meeting(&m))?;
+                let meeting = self
+                    .zoom
+                    .run(inv, &account, &Call::Update(&body))
+                    .await?
+                    .into_meeting()?;
+                let host = may_host(inv, &meeting, teacher.as_deref());
+                Ok(meeting.face(&face, host))
+            }
+            Verb::Delete => {
+                let teacher = teacher_arg(inv)?;
+                let account = self
+                    .zoom
+                    .account(inv, teacher.as_deref(), Target::Meeting(&m))?;
+                self.zoom.run(inv, &account, &Call::Cancel).await?;
+                Ok(repr(
+                    "text/plain",
+                    format!("Canceled meeting {MEETING_PREFIX}zoom-{m}.").into_bytes(),
+                ))
+            }
+            verb => Err(Error::Unsupported {
+                verb: Some(verb),
+                detail: "a meeting is read (Source), updated (Sink) or canceled (Delete)"
+                    .to_string(),
+            }),
+        }
+    }
+
+    fn name(&self) -> &str {
+        MEETING_ID
+    }
+
+    fn describe(&self) -> Description {
+        let binding = || {
+            ArgSpec::new("m")
+                .summary("the meeting: its provider and that provider's id, as zoom-<digits>")
+                .class(XSD_STRING)
+                .binding()
+        };
+        let fails = |action: ActionSpec| {
+            action
+                .requires(CAP_NET)
+                .requires(CAP_SECRET_READ)
+                .fails(FailureClass::Transient)
+                .fails(FailureClass::RetryAfter)
+                .fails(FailureClass::OverBudget)
+                .fails(FailureClass::Refused)
+                .fails(FailureClass::Unknown)
+        };
+        let mut update = ActionSpec::new(Verb::Sink)
+            .summary(
+                "Move or change the meeting: only what is given is sent to Zoom, and the answer \
+                 is the meeting Zoom then holds. Give at least one change. Only the meeting's \
+                 host's account can.",
+            )
+            .input(binding())
+            .input(
+                ArgSpec::new("topic")
+                    .summary("the new title")
+                    .class(XSD_STRING)
+                    .optional(),
+            )
+            .input(start_spec().optional())
+            .input(duration_spec().optional())
+            .input(timezone_spec())
+            .input(attendees_spec())
+            .input(agenda_spec())
+            .input(content_spec());
+        for spec in setting_specs(false) {
+            update = update.input(spec);
+        }
+        let update = update
+            .input(teacher_spec())
+            .input(face_spec())
+            .output(FACES[0])
+            .output(FACES[1])
+            .output(FACES[2]);
+        Description::new(MEETING_ID)
+            .summary(
+                "One meeting as a resource: read its details, move or change it, or cancel it. \
+                 The host start URL is only for the presenter.",
+            )
+            .action(fails(
+                ActionSpec::new(Verb::Source)
+                    .summary(
+                        "The meeting's details: the join URL (text), the shareable graph \
+                         (as=text/turtle) or the full envelope (as=application/json).",
+                    )
+                    .input(binding())
+                    .input(teacher_spec())
+                    .input(face_spec())
+                    .output(FACES[0])
+                    .output(FACES[1])
+                    .output(FACES[2]),
+            ))
+            .action(fails(update))
+            .action(fails(
+                ActionSpec::new(Verb::Delete)
+                    .summary(
+                        "Cancel the meeting. Only its host's account can; a canceled meeting is \
+                         then not found.",
+                    )
+                    .input(binding())
+                    .input(teacher_spec())
+                    .output(FACES[0]),
+            ))
+    }
+}
+
+impl Zoom {
+    /// The account a call acts in, with every rule checked before a socket opens: the token
+    /// endpoint's and the call's hosts must be granted (port-aware), and every keystore name the
+    /// call reads must be readable. With no teacher named, the shared Server-to-Server account
+    /// is used and every refusal precedes every secret read. With a teacher named, their record
+    /// is read first (under its own grant, `urn:cap:secret:read:<record>`), and what it selects
+    /// is checked before any other secret is read: the shared credentials for a teacher acting
+    /// through the shared account, or `urn:cap:secret:write:<record>` for a teacher's own app,
+    /// whose rotated refresh token must be kept.
+    fn account(
+        &self,
+        inv: &Invocation<'_>,
+        teacher: Option<&str>,
+        target: Target<'_>,
+    ) -> Result<Account> {
+        let url_for = |user: &str| match target {
+            Target::Create => self.config.meetings_url(user),
+            Target::Meeting(id) => self.config.meeting_url(id),
+        };
+        gate_net(inv, &self.config.token_url())?;
+        let Some(teacher) = teacher else {
+            let url = url_for(&self.config.user_id);
+            let user_url = self.config.user_url(&self.config.user_id);
+            gate_net(inv, &url)?;
+            gate_net(inv, &user_url)?;
+            self.gate_shared(inv)?;
+            return Ok(Account {
+                grant: Grant::Shared(self.credentials()?),
+                url,
+                user_url,
+                acting: format!("the configured Zoom user `{}`", self.config.user_id),
+            });
+        };
+        let record = self.config.teacher_secret(teacher);
+        let acting = format!("teacher `{teacher}`");
+        gate_secret(inv, "read", &record)?;
+        match self.teacher_record(&record)? {
+            TeacherRecord::Shared { user_id } => {
+                let user = path_segment(&user_id);
+                let url = url_for(&user);
+                let user_url = self.config.user_url(&user);
+                gate_net(inv, &url)?;
+                gate_net(inv, &user_url)?;
+                self.gate_shared(inv)?;
+                Ok(Account {
+                    grant: Grant::Shared(self.credentials()?),
+                    url,
+                    user_url,
+                    acting,
+                })
+            }
+            TeacherRecord::Own(app) => {
+                let url = url_for("me");
+                let user_url = self.config.user_url("me");
+                gate_net(inv, &url)?;
+                gate_net(inv, &user_url)?;
+                gate_secret(inv, "write", &record)?;
+                Ok(Account {
+                    grant: Grant::Own(app),
+                    url,
+                    user_url,
+                    acting,
+                })
+            }
+        }
+    }
+
+    /// Every shared credential name must be readable.
+    fn gate_shared(&self, inv: &Invocation<'_>) -> Result<()> {
+        for name in self.config.secret_names() {
+            gate_secret(inv, "read", name)?;
         }
         Ok(())
     }
 
-    /// The three credentials, each a trimmed UTF-8 string.
+    /// The three shared credentials, each a trimmed UTF-8 string.
     fn credentials(&self) -> Result<Credentials> {
         let [account_id, client_id, client_secret] = self.config.secret_names();
         Ok(Credentials {
@@ -591,35 +1002,212 @@ impl ZoomBackend {
             .map_err(|_| Error::Endpoint(format!("secret `{name}` is not valid UTF-8")))
     }
 
-    /// Exchange the S2S credentials for a short-lived bearer token.
-    /// `POST {oauth_base}/oauth/token`, HTTP Basic `client_id:client_secret`, with
-    /// `grant_type=account_credentials&account_id=…` as an `application/x-www-form-urlencoded`
-    /// body — RFC 6749 §4.4.2's client-credentials request. Zoom's own examples put those two
-    /// parameters in the QUERY; the body keeps the account id (a credential) out of every URL a
-    /// host transport might log. Answers the token and its `expires_in` (seconds), when stated.
-    /// An error answer is typed by [`origin_error`] (so a `401` for the client credentials is
-    /// [`Error::Refused`]), a transport failure by [`no_answer`].
-    async fn access_token(
+    /// A teacher's record: a JSON object naming the Zoom user the shared account acts for
+    /// (`user_id`), or the teacher's own app (`client_id`, `client_secret`, `refresh_token`).
+    /// The error names the record and the form it takes, never its contents.
+    fn teacher_record(&self, name: &str) -> Result<TeacherRecord> {
+        let malformed = || {
+            Error::Endpoint(format!(
+                "secret `{name}` is not a teacher record: store a JSON object with `user_id` \
+                 (a Zoom user in the shared account), or with `client_id`, `client_secret` and \
+                 `refresh_token` (the teacher's own Zoom app)"
+            ))
+        };
+        let fields = match serde_json::from_slice::<Value>(&self.secrets.read(name)?) {
+            Ok(Value::Object(fields)) => fields,
+            _ => return Err(malformed()),
+        };
+        let text = |key: &str| {
+            fields
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        if let Some(refresh_token) = text("refresh_token") {
+            let (Some(client_id), Some(client_secret)) = (text("client_id"), text("client_secret"))
+            else {
+                return Err(malformed());
+            };
+            return Ok(TeacherRecord::Own(OwnApp {
+                record: name.to_string(),
+                client_id,
+                client_secret,
+                refresh_token: Mutex::new(refresh_token),
+                fields,
+            }));
+        }
+        match text("user_id") {
+            Some(user_id) => Ok(TeacherRecord::Shared { user_id }),
+            None => Err(malformed()),
+        }
+    }
+
+    /// Run one call with the account's token: a cached one while the invocation's clock says
+    /// it is still good, else a fresh one (kept when there is a clock to judge it by). A `401`
+    /// for a cached token drops it and tries once more with a fresh one. The same clock
+    /// measures a `Retry-After` given as an HTTP-date.
+    async fn run(
+        &self,
+        inv: &Invocation<'_>,
+        account: &Account,
+        call: &Call<'_>,
+    ) -> Result<Outcome> {
+        let now = inv.now();
+        let token_url = self.config.token_url();
+        let key = account.key(&token_url);
+        if let Some(token) = now.and_then(|now| self.tokens.get(&key, now.as_millis())) {
+            match self.call(account, &token, call, true, now).await? {
+                Outcome::TokenRefused => self.tokens.evict(&key, &token),
+                done => return Ok(done),
+            }
+        }
+        let token = self.fresh_token(&token_url, account, &key, now).await?;
+        match self.call(account, &token, call, false, now).await? {
+            // Only a call made with a cached token answers `TokenRefused`; after a fresh token
+            // a `401` is the `Refused` it would otherwise have been.
+            Outcome::TokenRefused => {
+                Err(Error::Refused(format!("zoom {} returned 401", call.what())))
+            }
+            done => Ok(done),
+        }
+    }
+
+    /// A token minted now, kept in the cache when the invocation has a clock to judge it by.
+    async fn fresh_token(
         &self,
         token_url: &str,
-        creds: &Credentials,
+        account: &Account,
+        key: &TokenKey,
+        now: Option<Time>,
+    ) -> Result<String> {
+        let (token, expires_in) = match &account.grant {
+            Grant::Shared(creds) => {
+                let answer = self
+                    .token_exchange(
+                        token_url,
+                        &creds.client_id,
+                        &creds.client_secret,
+                        token_form(&creds.account_id),
+                        &account.secrets(),
+                        now,
+                    )
+                    .await?;
+                (answer.access_token, answer.expires_in)
+            }
+            Grant::Own(app) => {
+                // One refresh per teacher at a time. A call that waited finds the token the
+                // other minted (when there is a clock to keep it by), or else starts from the
+                // record as the other stored it, never from the refresh token Zoom just retired.
+                let lock = self.refreshing.for_record(&app.record);
+                let _held = lock.lock().await;
+                if let Some(token) = now.and_then(|now| self.tokens.get(key, now.as_millis())) {
+                    return Ok(token);
+                }
+                let latest = match self.teacher_record(&app.record)? {
+                    TeacherRecord::Own(latest) => latest,
+                    TeacherRecord::Shared { .. } => {
+                        return Err(Error::Endpoint(format!(
+                            "secret `{}` changed during the call from a teacher's own Zoom app \
+                             to a shared-account user; try again",
+                            app.record
+                        )))
+                    }
+                };
+                let answer = self.refresh(token_url, &latest, account, now).await?;
+                *app.refresh_token.lock().unwrap_or_else(|e| e.into_inner()) = latest
+                    .refresh_token
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                if let (Some(now), Some(expires_in)) = (now, answer.1) {
+                    self.tokens
+                        .put(key.clone(), &answer.0, now.as_millis(), expires_in);
+                }
+                return Ok(answer.0);
+            }
+        };
+        if let (Some(now), Some(expires_in)) = (now, expires_in) {
+            self.tokens
+                .put(key.clone(), &token, now.as_millis(), expires_in);
+        }
+        Ok(token)
+    }
+
+    /// A teacher's own app: exchange the refresh token for an access token. Zoom answers a new
+    /// refresh token, and the next refresh must use it, so the record is stored with it before
+    /// the token is used. A keystore that cannot store it fails the call and says what to do.
+    async fn refresh(
+        &self,
+        token_url: &str,
+        app: &OwnApp,
+        account: &Account,
         now: Option<Time>,
     ) -> Result<(String, Option<u64>)> {
-        // The shared RFC 7617 builder (ledger #1857). Its refusal names the broken rule and the
-        // stable code, never the client id or secret, so the error text is safe as it stands.
-        let auth =
-            ikigai_http::auth::basic(&creds.client_id, &creds.client_secret).map_err(|e| {
+        let current = app
+            .refresh_token
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let form = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("grant_type", "refresh_token")
+            .append_pair("refresh_token", &current)
+            .finish()
+            .into_bytes();
+        let answer = self
+            .token_exchange(
+                token_url,
+                &app.client_id,
+                &app.client_secret,
+                form,
+                &[account.secrets(), vec![current.clone()]].concat(),
+                now,
+            )
+            .await?;
+        if let Some(rotated) = answer.refresh_token.filter(|r| *r != current) {
+            let mut fields = app.fields.clone();
+            fields.insert("refresh_token".into(), json!(rotated));
+            let bytes = serde_json::to_vec(&Value::Object(fields)).unwrap_or_default();
+            self.secrets.store(&app.record, &bytes).map_err(|_| {
                 Error::Endpoint(format!(
-                    "zoom oauth: the client credentials cannot form a Basic header ({}): {e}",
-                    e.code()
+                    "zoom oauth: Zoom issued a new refresh token, but the keystore could not \
+                     store it in `{}`; the teacher must authorize the Zoom app again",
+                    app.record
                 ))
             })?;
-        let secrets = [
-            creds.account_id.as_str(),
-            creds.client_id.as_str(),
-            creds.client_secret.as_str(),
-            auth.credentials(),
-        ];
+            *app.refresh_token.lock().unwrap_or_else(|e| e.into_inner()) = rotated;
+        }
+        Ok((answer.access_token, answer.expires_in))
+    }
+
+    /// `POST {oauth_base}/oauth/token`, HTTP Basic `client_id:client_secret`, with `form` as an
+    /// `application/x-www-form-urlencoded` body — RFC 6749's token request. For the shared
+    /// account the form is `grant_type=account_credentials&account_id=…` (§4.4.2; Zoom's own
+    /// examples put those in the QUERY, and the body keeps the account id, a credential, out of
+    /// every URL a host transport might log); for a teacher's own app it is
+    /// `grant_type=refresh_token&refresh_token=…` (§6). An error answer is typed by
+    /// [`origin_error`] (so a `401` for the client credentials is [`Error::Refused`]), a
+    /// transport failure by [`no_answer`].
+    async fn token_exchange(
+        &self,
+        token_url: &str,
+        client_id: &str,
+        client_secret: &str,
+        form: Vec<u8>,
+        credentials: &[String],
+        now: Option<Time>,
+    ) -> Result<TokenAnswer> {
+        // The shared RFC 7617 builder (ledger #1857). Its refusal names the broken rule and the
+        // stable code, never the client id or secret, so the error text is safe as it stands.
+        let auth = ikigai_http::auth::basic(client_id, client_secret).map_err(|e| {
+            Error::Endpoint(format!(
+                "zoom oauth: the client credentials cannot form a Basic header ({}): {e}",
+                e.code()
+            ))
+        })?;
+        let mut secrets: Vec<&str> = credentials.iter().map(String::as_str).collect();
+        secrets.push(auth.credentials());
         let resp = self
             .transport
             .send(HttpRequest {
@@ -632,7 +1220,7 @@ impl ZoomBackend {
                         "application/x-www-form-urlencoded".to_string(),
                     ),
                 ],
-                body: token_form(&creds.account_id),
+                body: form,
             })
             .await
             .map_err(|e| no_answer(&e, token_url, "oauth", &secrets))?;
@@ -641,7 +1229,7 @@ impl ZoomBackend {
         }
         let v: Value = serde_json::from_slice(&read_body(resp.body, "oauth").await?)
             .map_err(|_| Error::Endpoint("zoom oauth: response not JSON".to_string()))?;
-        let token = v["access_token"]
+        let access_token = v["access_token"]
             .as_str()
             .map(str::to_string)
             .ok_or_else(|| {
@@ -651,138 +1239,542 @@ impl ZoomBackend {
         let expires_in = v["expires_in"]
             .as_u64()
             .or_else(|| v["expires_in"].as_str().and_then(|s| s.trim().parse().ok()));
-        Ok((token, expires_in))
+        let refresh_token = v["refresh_token"]
+            .as_str()
+            .filter(|r| !r.is_empty())
+            .map(str::to_string);
+        Ok(TokenAnswer {
+            access_token,
+            expires_in,
+            refresh_token,
+        })
     }
 
-    /// A token minted now, kept in the cache when the invocation has a clock to judge it by.
-    async fn fresh_token(
+    /// One call against Zoom's meeting API, with a bearer token. Create is `POST
+    /// /users/{user}/meetings` (`type: 2`, one scheduled meeting; the attendees as
+    /// `settings.meeting_invitees`); read is `GET /meetings/{id}`; update is `PATCH
+    /// /meetings/{id}` (answered `204`), then a read, so the answer is the meeting Zoom now
+    /// holds; cancel is `DELETE /meetings/{id}` (answered `204`). A `401` for a token the cache
+    /// supplied (`cached`) is [`Outcome::TokenRefused`]: nothing was changed, so the caller may
+    /// mint a fresh token and try once more. Every other error answer is typed by
+    /// [`origin_error`] (a `404` is [`Error::NotFound`]), a transport failure by [`no_answer`].
+    async fn call(
         &self,
-        token_url: &str,
-        creds: &Credentials,
-        key: &TokenKey,
-        now: Option<Time>,
-    ) -> Result<String> {
-        let (token, expires_in) = self.access_token(token_url, creds, now).await?;
-        if let (Some(now), Some(expires_in)) = (now, expires_in) {
-            self.tokens
-                .put(key.clone(), &token, now.as_millis(), expires_in);
-        }
-        Ok(token)
-    }
-
-    /// Create a scheduled meeting. `POST {api_base}/users/{user_id}/meetings`, Bearer token.
-    /// Request fields per Zoom's create-meeting API (`type: 2` = scheduled; the attendees as
-    /// `settings.meeting_invitees`, a list of `{"email": …}`); response fields
-    /// `id` / `join_url` / `start_url` / `password`. A `401` for a token the cache supplied
-    /// (`cached`) is [`Created::TokenRefused`], not an error: nothing was created, so the caller
-    /// may mint a fresh token and try once more. Every other error answer is typed by
-    /// [`origin_error`], a transport failure by [`no_answer`].
-    async fn create_meeting(
-        &self,
-        url: &str,
+        account: &Account,
         token: &str,
-        creds: &Credentials,
-        request: &MeetingRequest,
+        call: &Call<'_>,
         cached: bool,
         now: Option<Time>,
-    ) -> Result<Created> {
-        let secrets = [
-            creds.account_id.as_str(),
-            creds.client_id.as_str(),
-            creds.client_secret.as_str(),
-            token,
-        ];
-        let mut body = json!({
-            "topic": request.topic,
-            "type": 2,
-            "start_time": request.start,
-            "duration": request.duration,
-            "settings": { "join_before_host": true, "waiting_room": false }
-        });
-        if let Some(tz) = &request.timezone {
-            body["timezone"] = json!(tz);
+    ) -> Result<Outcome> {
+        let mut secrets = account.secrets();
+        secrets.push(token.to_string());
+        macro_rules! send {
+            ($method:expr, $body:expr, $what:expr, $cached:expr) => {
+                send!($method, &account.url, $body, $what, $cached)
+            };
+            ($method:expr, $url:expr, $body:expr, $what:expr, $cached:expr) => {
+                self.exchange($method, $url, token, $body, $what, &secrets, $cached, now)
+            };
         }
-        if let Some(agenda) = &request.agenda {
-            body["agenda"] = json!(agenda);
+        match call {
+            Call::Create(request) => {
+                let body = create_body(request);
+                let Some(v) = send!(Method::Post, Some(&body), call.what(), cached).await? else {
+                    return Ok(Outcome::TokenRefused);
+                };
+                let mut meeting = parse_meeting(&v, call.what())?;
+                meeting.attendees = request.attendees.clone();
+                Ok(Outcome::Meeting(meeting))
+            }
+            Call::Get { host_only: false } => {
+                match send!(Method::Get, None, call.what(), cached).await? {
+                    None => Ok(Outcome::TokenRefused),
+                    Some(v) => Ok(Outcome::Meeting(parse_meeting(&v, call.what())?)),
+                }
+            }
+            _ => {
+                // The account must host the meeting. Who it acts for comes first, so only that
+                // read can meet a stale cached token; nothing has been changed by then.
+                let Some(user) =
+                    send!(Method::Get, &account.user_url, None, "get-user", cached).await?
+                else {
+                    return Ok(Outcome::TokenRefused);
+                };
+                let user_id = response_string(&user, "get-user", "id")?;
+                let current = send!(Method::Get, None, "get-meeting", false)
+                    .await?
+                    .ok_or_else(|| Error::Refused("zoom get-meeting returned 401".to_string()))?;
+                let host_id = response_string(&current, "get-meeting", "host_id")?;
+                if host_id != user_id {
+                    let id = parse_meeting(&current, "get-meeting")?.id;
+                    return Err(Error::Denied(
+                        format!(
+                            "{} does not host meeting {MEETING_PREFIX}zoom-{id}: another Zoom \
+                             user does, so only that meeting's own teacher can read its host \
+                             details, change it or cancel it",
+                            account.acting
+                        )
+                        .into(),
+                    ));
+                }
+                self.act(account, call, current, token, &secrets, now).await
+            }
         }
-        if !request.attendees.is_empty() {
-            body["settings"]["meeting_invitees"] = request
-                .attendees
-                .iter()
-                .map(|email| json!({ "email": email }))
-                .collect();
+    }
+
+    /// A call on a meeting its account hosts, `current` being the meeting as just read.
+    async fn act(
+        &self,
+        account: &Account,
+        call: &Call<'_>,
+        current: Value,
+        token: &str,
+        secrets: &[String],
+        now: Option<Time>,
+    ) -> Result<Outcome> {
+        macro_rules! send {
+            ($method:expr, $body:expr, $what:expr) => {
+                self.exchange(
+                    $method,
+                    &account.url,
+                    token,
+                    $body,
+                    $what,
+                    secrets,
+                    false,
+                    now,
+                )
+            };
+        }
+        match call {
+            Call::Create(_) | Call::Get { host_only: false } => Err(Error::Endpoint(
+                "zoom: not a call on an existing meeting".to_string(),
+            )),
+            Call::Get { host_only: true } => {
+                Ok(Outcome::Meeting(parse_meeting(&current, "get-meeting")?))
+            }
+            Call::Update(body) => {
+                send!(Method::Patch, Some(body), call.what())
+                    .await?
+                    .ok_or_else(|| {
+                        Error::Refused("zoom update-meeting returned 401".to_string())
+                    })?;
+                let v = send!(Method::Get, None, "get-meeting")
+                    .await?
+                    .ok_or_else(|| Error::Refused("zoom get-meeting returned 401".to_string()))?;
+                Ok(Outcome::Meeting(parse_meeting(&v, "get-meeting")?))
+            }
+            Call::Cancel => {
+                send!(Method::Delete, None, call.what())
+                    .await?
+                    .ok_or_else(|| {
+                        Error::Refused("zoom cancel-meeting returned 401".to_string())
+                    })?;
+                Ok(Outcome::Canceled)
+            }
+        }
+    }
+
+    /// One request with a bearer token: the answer's JSON (`Value::Null` for an empty body), or
+    /// `None` for a `401` when `cached` says the token came from the cache.
+    #[allow(clippy::too_many_arguments)]
+    async fn exchange(
+        &self,
+        method: Method,
+        url: &str,
+        token: &str,
+        body: Option<&Value>,
+        what: &str,
+        secrets: &[String],
+        cached: bool,
+        now: Option<Time>,
+    ) -> Result<Option<Value>> {
+        let secrets: Vec<&str> = secrets.iter().map(String::as_str).collect();
+        let mut headers = vec![("Authorization".to_string(), format!("Bearer {token}"))];
+        if body.is_some() {
+            headers.push(("Content-Type".to_string(), "application/json".to_string()));
         }
         let resp = self
             .transport
             .send(HttpRequest {
-                method: Method::Post,
+                method,
                 url: url.to_string(),
-                headers: vec![
-                    ("Authorization".to_string(), format!("Bearer {token}")),
-                    ("Content-Type".to_string(), "application/json".to_string()),
-                ],
-                body: serde_json::to_vec(&body).unwrap_or_default(),
+                headers,
+                body: body
+                    .map(|b| serde_json::to_vec(b).unwrap_or_default())
+                    .unwrap_or_default(),
             })
             .await
-            .map_err(|e| no_answer(&e, url, "create-meeting", &secrets))?;
+            .map_err(|e| no_answer(&e, url, what, &secrets))?;
         if resp.status == 401 && cached {
-            return Ok(Created::TokenRefused);
+            return Ok(None);
         }
         if resp.status >= 400 {
-            return Err(origin_error(resp, now, "create-meeting", &secrets).await);
+            return Err(origin_error(resp, now, what, &secrets).await);
         }
-        let v: Value = serde_json::from_slice(&read_body(resp.body, "create-meeting").await?)
-            .map_err(|_| Error::Endpoint("zoom create-meeting: response not JSON".to_string()))?;
-        // Zoom returns the meeting id as a NUMBER; accept a string too, defensively.
-        let id = v["id"]
-            .as_i64()
-            .map(|n| n.to_string())
-            .or_else(|| v["id"].as_str().map(str::to_string))
-            .filter(|id| {
-                !id.is_empty()
-                    && id.bytes().all(|b| b.is_ascii_digit())
-                    && id.bytes().any(|b| b != b'0')
-            })
-            .ok_or_else(|| response_field("id"))?;
-        let join_url = response_string(&v, "join_url")?;
-        let start_url = response_string(&v, "start_url")?;
-        let topic = response_string(&v, "topic")?;
-        let start = response_string(&v, "start_time")?;
-        let start_time = utc_datetime(&start).ok_or_else(|| response_field("start_time"))?;
-        let duration = v["duration"]
-            .as_u64()
-            .filter(|n| (1..=1440).contains(n))
-            .ok_or_else(|| response_field("duration"))? as u32;
-        // A meeting need not have a passcode. Preserve absence rather than inventing one.
-        let passcode = match v.get("password") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(value)) => Some(value.clone()),
-            _ => return Err(response_field("password")),
-        };
-        Ok(Created::Meeting(Meeting {
-            id,
-            join_url,
-            start_url,
-            passcode,
-            topic,
-            start_time,
-            duration,
-            attendees: request.attendees.clone(),
-        }))
+        let bytes = read_body(resp.body, what).await?;
+        if bytes.iter().all(u8::is_ascii_whitespace) {
+            return Ok(Some(Value::Null));
+        }
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|_| Error::Endpoint(format!("zoom {what}: response not JSON")))
     }
 }
 
-impl Created {
-    /// The meeting. Only a call made with a cached token can answer `TokenRefused`, so after a
-    /// fresh token it is the plain `401` it would otherwise have been: a [`Error::Refused`].
-    fn into_meeting(self) -> Result<Meeting> {
-        match self {
-            Created::Meeting(meeting) => Ok(meeting),
-            Created::TokenRefused => Err(Error::Refused(
-                "zoom create-meeting returned 401".to_string(),
-            )),
-        }
+/// What a teacher's record selects.
+enum TeacherRecord {
+    Shared { user_id: String },
+    Own(OwnApp),
+}
+
+/// A token endpoint's answer.
+struct TokenAnswer {
+    access_token: String,
+    expires_in: Option<u64>,
+    refresh_token: Option<String>,
+}
+
+/// The create-meeting body: one scheduled meeting (`type: 2`), never a recurring series (`type:
+/// 8`) — one meeting per occurrence, the caller expanding any recurrence itself.
+fn create_body(request: &MeetingRequest) -> Value {
+    let mut settings = request.settings.json();
+    if !request.attendees.is_empty() {
+        settings.insert("meeting_invitees".into(), invitees(&request.attendees));
     }
+    let mut body = json!({
+        "topic": request.topic,
+        "type": 2,
+        "start_time": request.start,
+        "duration": request.duration,
+        "settings": settings,
+    });
+    if let Some(tz) = &request.timezone {
+        body["timezone"] = json!(tz);
+    }
+    if let Some(agenda) = &request.agenda {
+        body["agenda"] = json!(agenda);
+    }
+    body
+}
+
+/// Zoom's `meeting_invitees`: a list of `{"email": …}`.
+fn invitees(attendees: &[String]) -> Value {
+    attendees
+        .iter()
+        .map(|email| json!({ "email": email }))
+        .collect()
+}
+
+/// A meeting from a Zoom answer. Required fields that are missing, null or malformed are
+/// reported, never replaced with request values. The attendees are Zoom's `meeting_invitees`,
+/// those that are addresses [`is_email`] accepts.
+fn parse_meeting(v: &Value, what: &str) -> Result<Meeting> {
+    // Zoom returns the meeting id as a NUMBER; accept a string too, defensively.
+    let id = v["id"]
+        .as_i64()
+        .map(|n| n.to_string())
+        .or_else(|| v["id"].as_str().map(str::to_string))
+        .filter(|id| is_zoom_id(id))
+        .ok_or_else(|| response_field(what, "id"))?;
+    let join_url = response_string(v, what, "join_url")?;
+    let start_url = response_string(v, what, "start_url")?;
+    let topic = response_string(v, what, "topic")?;
+    let start = response_string(v, what, "start_time")?;
+    let start_time = utc_datetime(&start).ok_or_else(|| response_field(what, "start_time"))?;
+    let duration = v["duration"]
+        .as_u64()
+        .filter(|n| (1..=1440).contains(n))
+        .ok_or_else(|| response_field(what, "duration"))? as u32;
+    // A meeting need not have a passcode. Preserve absence rather than inventing one.
+    let passcode = match v.get("password") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.clone()),
+        _ => return Err(response_field(what, "password")),
+    };
+    let attendees = v["settings"]["meeting_invitees"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(|i| i["email"].as_str())
+                .filter(|e| is_email(e))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Meeting {
+        id,
+        join_url,
+        start_url,
+        passcode,
+        topic,
+        start_time,
+        duration,
+        attendees,
+    })
+}
+
+/// A Zoom meeting id: decimal digits, not all zero, at most 20 of them.
+fn is_zoom_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 20
+        && id.bytes().all(|b| b.is_ascii_digit())
+        && id.bytes().any(|b| b != b'0')
+}
+
+/// The meeting a `urn:meeting:id:{m}` names: `{m}` is `zoom-<digits>`; Zoom's id is answered.
+fn meeting_name(inv: &Invocation<'_>) -> Result<String> {
+    inv.bindings
+        .get("m")
+        .and_then(|m| m.strip_prefix("zoom-"))
+        .filter(|id| is_zoom_id(id))
+        .map(str::to_string)
+        .ok_or_else(|| {
+            invalid(
+                "m",
+                "not a meeting name (zoom- and the Zoom meeting id's digits)",
+            )
+        })
+}
+
+/// May this caller see the host link? Only the presenter: a holder of
+/// `urn:cap:meeting:host:id:{m}` for this meeting, or of `urn:cap:meeting:host:teacher:{t}` for
+/// the teacher whose account hosts it. Root holds both.
+fn may_host(inv: &Invocation<'_>, meeting: &Meeting, teacher: Option<&str>) -> bool {
+    inv.capability
+        .allows(&format!("{CAP_HOST_MEETING}zoom-{}", meeting.id))
+        || teacher.is_some_and(|t| inv.capability.allows(&format!("{CAP_HOST_TEACHER}{t}")))
+}
+
+/// A secret grant, checked before the secret is read or stored: `action` is `read` or `write`.
+fn gate_secret(inv: &Invocation<'_>, action: &str, name: &str) -> Result<()> {
+    let scope = format!("urn:cap:secret:{action}:{name}");
+    if inv.capability.allows(&scope) {
+        return Ok(());
+    }
+    let doing = if action == "read" {
+        "reading"
+    } else {
+        "storing"
+    };
+    Err(Error::Denied(
+        format!("capability does not allow {doing} secret `{name}` (needs {scope})").into(),
+    ))
+}
+
+/// A URL path segment: ASCII letters, digits and `-._~` pass; every other byte is
+/// percent-encoded, so a user id such as an email address is one segment.
+fn path_segment(value: &str) -> String {
+    /// Every byte but RFC 3986's unreserved characters.
+    const SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    percent_encoding::utf8_percent_encode(value, SEGMENT).to_string()
+}
+
+/// An optional `xsd:boolean`: `true`, `false`, `1` or `0`.
+fn boolean(inv: &Invocation<'_>, name: &str) -> Result<Option<bool>> {
+    match optional(inv, name)?.as_deref() {
+        None => Ok(None),
+        Some("true" | "1") => Ok(Some(true)),
+        Some("false" | "0") => Ok(Some(false)),
+        Some(_) => Err(invalid(name, "not an xsd:boolean (true or false)")),
+    }
+}
+
+/// The `teacher` whose account the call acts in: a name that is safe inside a keystore name.
+fn teacher_arg(inv: &Invocation<'_>) -> Result<Option<String>> {
+    match optional(inv, "teacher")? {
+        None => Ok(None),
+        Some(t)
+            if !t.is_empty()
+                && t.len() <= 64
+                && t.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+                && !t.starts_with('.') =>
+        {
+            Ok(Some(t))
+        }
+        Some(_) => Err(invalid(
+            "teacher",
+            "not a teacher name (1 to 64 ASCII letters, digits, `-`, `_` or `.`, not starting \
+             with `.`)",
+        )),
+    }
+}
+
+/// The `timezone`, held to the IANA zones.
+fn timezone_arg(inv: &Invocation<'_>) -> Result<(Option<String>, Option<chrono_tz::Tz>)> {
+    let timezone = optional(inv, "timezone")?;
+    let zone = timezone
+        .as_deref()
+        .map(|name| {
+            name.parse::<chrono_tz::Tz>()
+                .map_err(|_| invalid("timezone", "not a recognized IANA time zone"))
+        })
+        .transpose()?;
+    Ok((timezone, zone))
+}
+
+/// A `start`, held to `xsd:dateTime` and resolved to the instant Zoom is sent.
+fn start_value(start: &str, zone: Option<chrono_tz::Tz>) -> Result<String> {
+    let start = start.trim();
+    if !is_xsd_datetime(start) {
+        return Err(invalid(
+            "start",
+            "not an xsd:dateTime (YYYY-MM-DDThh:mm:ss, optionally .fff and Z or ±hh:mm)",
+        ));
+    }
+    normalize_start(start, zone)
+}
+
+/// The `duration` in whole minutes, from 1 through 1440.
+fn duration_arg(inv: &Invocation<'_>) -> Result<Option<u32>> {
+    match optional(inv, "duration")? {
+        None => Ok(None),
+        Some(minutes) => match minutes.parse::<u32>() {
+            Ok(n) if (1..=1440).contains(&n) => Ok(Some(n)),
+            _ => Err(invalid(
+                "duration",
+                "not a positive xsd:integer of minutes, at most one day",
+            )),
+        },
+    }
+}
+
+/// The `attendees` list.
+fn attendees_arg(inv: &Invocation<'_>) -> Result<Option<Vec<String>>> {
+    match optional(inv, "attendees")? {
+        None => Ok(None),
+        Some(list) => parse_attendees(&list).map(Some).ok_or_else(|| {
+            invalid(
+                "attendees",
+                "not a list of email addresses (separated by commas, semicolons or whitespace)",
+            )
+        }),
+    }
+}
+
+/// The face `as=` selects.
+fn face_arg(inv: &Invocation<'_>) -> Result<String> {
+    let face = optional(inv, "as")?.unwrap_or_else(|| FACES[0].to_string());
+    if !FACES.contains(&face.as_str()) {
+        return Err(invalid(
+            "as",
+            "not one of text/plain, text/turtle, application/json",
+        ));
+    }
+    Ok(face)
+}
+
+fn start_spec() -> ArgSpec {
+    ArgSpec::new("start")
+        .summary(
+            "start time: RFC 3339 with an offset, or local time with `timezone`; \
+             DST gaps and overlaps require an offset; answers use UTC",
+        )
+        .class(XSD_DATETIME)
+}
+
+fn duration_spec() -> ArgSpec {
+    ArgSpec::new("duration")
+        .summary("length in minutes, an integer from 1 through 1440 (default 30)")
+        .class(XSD_INTEGER)
+}
+
+fn timezone_spec() -> ArgSpec {
+    ArgSpec::new("timezone")
+        .summary("IANA zone for local start times (e.g. America/Los_Angeles); omitted uses the Zoom account zone")
+        .class(XSD_STRING)
+        .optional()
+}
+
+fn attendees_spec() -> ArgSpec {
+    ArgSpec::new("attendees")
+        .summary(
+            "who the meeting is for: email addresses, separated by commas, semicolons \
+             or whitespace (Zoom's meeting invitees; ical:attendee in the graph)",
+        )
+        .class(XSD_STRING)
+        .optional()
+}
+
+fn agenda_spec() -> ArgSpec {
+    ArgSpec::new("agenda")
+        .summary("a longer description")
+        .class(XSD_STRING)
+        .optional()
+}
+
+fn content_spec() -> ArgSpec {
+    ArgSpec::new("content")
+        .summary("the agenda, when piped or given as the sink's body — a named `agenda` wins")
+        .class(XSD_STRING)
+        .optional()
+}
+
+fn teacher_spec() -> ArgSpec {
+    ArgSpec::new("teacher")
+        .summary(
+            "the teacher whose Zoom account hosts the meeting: their record in the keystore \
+             (zoom-teacher-<teacher>); omitted uses the shared account's configured user",
+        )
+        .class(XSD_STRING)
+        .optional()
+}
+
+fn face_spec() -> ArgSpec {
+    ArgSpec::new("as")
+        .summary("the face: the join URL, the shareable graph, or the full envelope")
+        .class(XSD_STRING)
+        .one_of(FACES)
+        .default_value(FACES[0])
+        .optional()
+}
+
+/// The meeting settings as inputs. A new meeting states their defaults; an update has none,
+/// since a setting not given is left as it is.
+fn setting_specs(new: bool) -> Vec<ArgSpec> {
+    let flag = |name: &str, summary: &str, default: bool| {
+        let spec = ArgSpec::new(name)
+            .summary(summary.to_string())
+            .class(XSD_BOOLEAN)
+            .optional();
+        if new {
+            spec.default_value(default.to_string())
+        } else {
+            spec
+        }
+    };
+    let recording = ArgSpec::new("auto_recording")
+        .summary("record automatically: none, local or cloud (default none)")
+        .class(XSD_STRING)
+        .one_of(AUTO_RECORDING)
+        .optional();
+    vec![
+        flag(
+            "waiting_room",
+            "hold people in a waiting room until the host admits them (default true)",
+            true,
+        ),
+        flag(
+            "join_before_host",
+            "let people join before the host (default false)",
+            false,
+        ),
+        flag(
+            "authenticated_join",
+            "only signed-in Zoom users may join (default false)",
+            false,
+        ),
+        if new {
+            recording.default_value(AUTO_RECORDING[0])
+        } else {
+            recording
+        },
+    ]
 }
 
 /// An error ANSWER from Zoom, typed by ikigai-http's one status table
@@ -1054,18 +2046,18 @@ fn normalize_start(s: &str, zone: Option<chrono_tz::Tz>) -> Result<String> {
     }
 }
 
-fn response_field(name: &str) -> Error {
+fn response_field(what: &str, name: &str) -> Error {
     Error::Endpoint(format!(
-        "zoom create-meeting: missing or invalid {name} in response"
+        "zoom {what}: missing or invalid {name} in response"
     ))
 }
 
-fn response_string(v: &Value, name: &str) -> Result<String> {
+fn response_string(v: &Value, what: &str, name: &str) -> Result<String> {
     v[name]
         .as_str()
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| response_field(name))
+        .ok_or_else(|| response_field(what, name))
 }
 
 /// A scheduled meeting, provider-neutral.
@@ -1102,10 +2094,7 @@ impl Meeting {
         s.push_str("@prefix dcterms: <http://purl.org/dc/terms/> .\n");
         s.push_str("@prefix schema: <https://schema.org/> .\n");
         s.push_str("@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\n");
-        s.push_str(&format!(
-            "{} a ical:Vevent ;\n",
-            ttl_iri(&format!("urn:meeting:zoom:{}", self.id))
-        ));
+        s.push_str(&format!("{} a ical:Vevent ;\n", ttl_iri(&self.name())));
         s.push_str("    schema:provider \"zoom\" ;\n");
         s.push_str(&format!("    dcterms:identifier {} ;\n", ttl_str(&self.id)));
         s.push_str(&format!("    ical:summary {} ;\n", ttl_str(&self.topic)));
@@ -1135,20 +2124,42 @@ impl Meeting {
         s.into_bytes()
     }
 
-    /// The FULL envelope for the trusted caller — includes the host `start_url`.
-    fn json_envelope(&self) -> Vec<u8> {
-        serde_json::to_vec(&json!({
+    /// The FULL envelope: the meeting's resource name and Zoom's fields. The host `start_url`
+    /// (a URL that carries a host token) is in it only when `host` says the caller is the
+    /// presenter ([`may_host`]); otherwise the key is absent.
+    fn json_envelope(&self, host: bool) -> Vec<u8> {
+        let mut envelope = json!({
+            "meeting": self.name(),
             "provider": "zoom",
             "id": self.id,
             "join_url": self.join_url,
-            "start_url": self.start_url,
             "passcode": self.passcode,
             "topic": self.topic,
             "start_time": self.start_time,
             "duration": self.duration,
             "attendees": self.attendees,
-        }))
-        .unwrap_or_default()
+        });
+        if host {
+            envelope["start_url"] = json!(self.start_url);
+        }
+        serde_json::to_vec(&envelope).unwrap_or_default()
+    }
+
+    /// The meeting's resource name, `urn:meeting:id:zoom-<id>`: what Source, Sink and Delete
+    /// address, and the graph's subject.
+    fn name(&self) -> String {
+        format!("{MEETING_PREFIX}zoom-{}", self.id)
+    }
+
+    /// The face `as=` selected: default `text/plain` = the join URL (what an invite needs);
+    /// `text/turtle` = the SHAREABLE graph (join-safe, `ical:conference`, never the host URL);
+    /// `application/json` = the full envelope, with the host URL for the presenter only.
+    fn face(self, face: &str, host: bool) -> Representation {
+        match face {
+            "text/turtle" => repr("text/turtle", self.turtle()),
+            "application/json" => repr("application/json", self.json_envelope(host)),
+            _ => repr("text/plain", self.join_url.into_bytes()),
+        }
     }
 }
 
@@ -1316,7 +2327,7 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("<urn:meeting:zoom:88899900011> a ical:Vevent"),
+            out.contains("<urn:meeting:id:zoom-88899900011> a ical:Vevent"),
             "{out}"
         );
         assert!(out.contains("dcterms:identifier \"88899900011\""), "{out}");

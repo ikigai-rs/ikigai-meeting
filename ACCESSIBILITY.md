@@ -10,7 +10,7 @@ and how to report a barrier. It is not a conformance claim. Adapted from the
 | Status | Evaluation in progress. No conformance claim. |
 | Owner | the maintainers of this repository |
 | Report a barrier | [a GitHub issue](https://github.com/ikigai-rs/ikigai-meeting/issues/new?labels=accessibility) with the `accessibility` label; anything security-sensitive through [private vulnerability reporting](https://github.com/ikigai-rs/ikigai-meeting/security/advisories/new) |
-| Last reviewed | 2026-11-12 |
+| Last reviewed | 2026-11-27 |
 
 ## What it emits that people read
 
@@ -21,11 +21,18 @@ and how to report a barrier. It is not a conformance claim. Adapted from the
   (`src/lib.rs`): the join URL alone as `text/plain` (the default), a shareable Turtle graph
   (`as=text/turtle`), or the full JSON envelope (`as=application/json`). People read the URL in
   an invite; the graph and JSON are read through other tools.
+- **One meeting** from `urn:meeting:id:{m}` (`src/lib.rs`): Source and Sink answer the same
+  three faces; Delete answers one sentence, `Canceled meeting urn:meeting:id:{m}.`, as
+  `text/plain`. The JSON face carries the host link only for the presenter.
 - **Refusals** (`src/lib.rs`): a missing input (`MissingArgument`, naming it), an input outside
   its type (`InvalidArgument`, naming it and saying the form it takes, for example `not a list
   of email addresses (separated by commas, semicolons or whitespace)`), a capability that does
   not reach a host or a credential (`Denied`, naming the host or secret and the capability it
-  needs), and the outcome of a call to Zoom (`zoom <step> returned <status>…`, a body over its
+  needs), a teacher acting on a meeting their account does not host (`Denied`, naming the
+  teacher and the meeting), an update with nothing to change (`MissingArgument`, listing what can change), a
+  teacher record of the wrong shape (naming the record and the shapes it takes), a rotated
+  refresh token the keystore could not store (saying the teacher must authorize the app again),
+  and the outcome of a call to Zoom (`zoom <step> returned <status>…`, a body over its
   bound, a transport failure).
 
 Not this repository's: the sentence each error kind is wrapped in (ikigai-core's `Display`);
@@ -65,6 +72,9 @@ it does not repeat the source review or run browser or assistive technology chec
 | Recovery guidance and configured URL identification | Fail | Source review, 2026-11-12: `access_token` emits `response not JSON` or `no access_token in response` without a remedy; `gate_net` emits `bad url: …` without naming the configured URL. |
 | Default output includes meeting context | Fail | `schedule_returns_the_join_url_by_default` and source review, 2026-11-12: the default face is only the join URL, without topic or start time. |
 | Language selection | Fail | Source review of `src/lib.rs`, 2026-11-12: module-authored messages are English with no language selector; upstream text can differ. |
+| Meeting resource refusals are named without echoing values | Pass | `tests/meeting_resource.rs`: `a_malformed_meeting_name_is_invalid_before_any_request`, `a_setting_outside_its_type_is_named_and_not_echoed`, `a_teacher_is_reached_only_through_their_own_grant`, `an_update_with_nothing_to_change_is_refused_before_any_request`; run by `cargo test --all-targets` (Cargo 1.99.0, rustc 1.99.0) on 2026-11-27 and by CI. Selected cases, not every input. |
+| Host link withheld from all but the presenter | Pass | `tests/meeting_resource.rs`: `the_host_link_is_sealed_to_the_presenter`; `tests/conformance.rs`: `the_meeting_resource_serves_its_declared_faces_and_denies_first`; same command and CI. Checks the JSON keys served, not a host's presentation. |
+| Cancellation sentence names the meeting | Pass | `tests/conformance.rs`: `the_meeting_resource_serves_its_declared_faces_and_denies_first` checks the exact text and media type; same command and CI. Does not evaluate spoken clarity. |
 | Documentation rendering and browser presentation | Blocked | No browser rendering check was run for the Markdown or output in a consuming host; no browser evaluation was configured for this update. |
 | Manual keyboard | Blocked | No person performed a keyboard pass in a consuming tool; no interactive evaluation session was available for this update. |
 | Automated accessibility checker | Blocked | No axe or other automated accessibility checker was run on rendered documentation or output; no browser checker was configured. Rust tests are not an accessibility checker. |
@@ -106,3 +116,4 @@ through [private vulnerability reporting](https://github.com/ikigai-rs/ikigai-me
 |---|---|
 | 2026-10-31 | First version. |
 | 2026-11-12 | Record scoped Pass, Fail and Blocked results, current main test evidence and unrun assistive technology checks. |
+| 2026-11-27 | Add the meeting resource's faces and refusals, and their tested checks (ledger #4519). |
