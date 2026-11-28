@@ -15,6 +15,9 @@
 //! auto-recording) are arguments with stated defaults, never hard-coded. `teacher=<t>` acts in
 //! that teacher's account, from their record in the keystore. The host link (`start_url`) is
 //! sealed to the presenter: [`CAP_HOST_MEETING`] or [`CAP_HOST_TEACHER`].
+//! Only the meeting's host's account reaches it: an update, a cancel, or a read naming a
+//! teacher is [`Error::Denied`] unless the Zoom user the account acts for is the meeting's
+//! `host_id`, so one teacher's grants never reach another teacher's meeting.
 //!
 //! ## Injection, not dependencies
 //!
@@ -213,6 +216,12 @@ impl ZoomConfig {
         )
     }
 
+    /// One user's endpoint, for the Zoom user id an account acts for: a path segment, already
+    /// encoded, or `me`.
+    fn user_url(&self, user: &str) -> String {
+        format!("{}/users/{user}", self.api_base.trim_end_matches('/'))
+    }
+
     /// One meeting's endpoint (read, update, cancel), by Zoom's numeric id.
     fn meeting_url(&self, id: &str) -> String {
         format!("{}/meetings/{id}", self.api_base.trim_end_matches('/'))
@@ -292,6 +301,7 @@ pub fn space(
         secrets,
         config,
         tokens: Arc::default(),
+        refreshing: RefreshLocks::default(),
     });
     EndpointSpace::new()
         .bind(
@@ -336,6 +346,24 @@ struct Zoom {
     secrets: Arc<dyn SecretReader>,
     config: ZoomConfig,
     tokens: Arc<TokenCache>,
+    refreshing: RefreshLocks,
+}
+
+/// One async lock per teacher record with its own app. Zoom rotates the refresh token on every
+/// refresh and refuses the old one, so two refreshes for one teacher must not both start from
+/// the same token: the second waits, then starts from the record the first stored.
+#[derive(Default)]
+struct RefreshLocks(Mutex<HashMap<String, Arc<futures_util::lock::Mutex<()>>>>);
+
+impl RefreshLocks {
+    fn for_record(&self, record: &str) -> Arc<futures_util::lock::Mutex<()>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(record.to_string())
+            .or_default()
+            .clone()
+    }
 }
 
 /// One meeting as the caller asked for it — the validated inputs.
@@ -363,17 +391,10 @@ struct Settings {
 pub const AUTO_RECORDING: [&str; 3] = ["none", "local", "cloud"];
 
 impl Settings {
-    /// The settings given as arguments, each held to its type. `captions` is refused: Zoom sets
-    /// captions for an account or a user, never for one meeting, so no value could be honored.
+    /// The settings given as arguments, each held to its type. There is no `captions`: Zoom's
+    /// meeting API has no per-meeting captions field (captions are an account or user setting),
+    /// so an argument for them could never be honored.
     fn parse(inv: &Invocation<'_>) -> Result<Settings> {
-        if optional(inv, "captions")?.is_some() {
-            return Err(Error::Unsupported {
-                verb: None,
-                detail: "captions cannot be set for one Zoom meeting: Zoom applies the host's \
-                         account or user captions setting; set it there"
-                    .to_string(),
-            });
-        }
         let auto_recording = match optional(inv, "auto_recording")? {
             None => None,
             Some(value) if AUTO_RECORDING.contains(&value.as_str()) => Some(value),
@@ -507,10 +528,16 @@ enum Grant {
     Own(OwnApp),
 }
 
-/// The account a call acts in, and the API URL it calls, both already authorized.
+/// The account a call acts in, the API URL it calls and the user it acts for, all already
+/// authorized.
 struct Account {
     grant: Grant,
     url: String,
+    /// `GET` this for the Zoom user the account acts for: its `id` must be a meeting's
+    /// `host_id` before the meeting is changed, canceled or its host details read.
+    user_url: String,
+    /// Who the call acts for, in a refusal's words: the teacher, or the configured user.
+    acting: String,
 }
 
 impl Account {
@@ -556,9 +583,16 @@ enum Target<'a> {
 }
 
 /// One call against a meeting.
+///
+/// Every call on an existing meeting except a read without a teacher first proves the account
+/// hosts it: the account's user `id` must be the meeting's `host_id`. Otherwise one teacher's
+/// grants would reach another teacher's meeting through the shared account's token.
 enum Call<'a> {
     Create(&'a MeetingRequest),
-    Get,
+    /// A read; `host_only` when a teacher is named, so their host link is theirs.
+    Get {
+        host_only: bool,
+    },
     Update(&'a Value),
     Cancel,
 }
@@ -567,18 +601,18 @@ impl Call<'_> {
     fn what(&self) -> &'static str {
         match self {
             Call::Create(_) => "create-meeting",
-            Call::Get => "get-meeting",
+            Call::Get { .. } => "get-meeting",
             Call::Update(_) => "update-meeting",
             Call::Cancel => "cancel-meeting",
         }
     }
 }
 
-/// What a call came back with: the meeting, a cancellation, or a `401` for a token the cache
+/// What a call came back with: the meeting, a cancelation, or a `401` for a token the cache
 /// supplied, which the caller answers by minting a fresh one and trying once more.
 enum Outcome {
     Meeting(Meeting),
-    Cancelled,
+    Canceled,
     TokenRefused,
 }
 
@@ -697,7 +731,13 @@ impl Endpoint for MeetingById {
                     .account(inv, teacher.as_deref(), Target::Meeting(&m))?;
                 let meeting = self
                     .zoom
-                    .run(inv, &account, &Call::Get)
+                    .run(
+                        inv,
+                        &account,
+                        &Call::Get {
+                            host_only: teacher.is_some(),
+                        },
+                    )
                     .await?
                     .into_meeting()?;
                 let host = may_host(inv, &meeting, teacher.as_deref());
@@ -777,12 +817,12 @@ impl Endpoint for MeetingById {
                 self.zoom.run(inv, &account, &Call::Cancel).await?;
                 Ok(repr(
                     "text/plain",
-                    format!("Cancelled meeting {MEETING_PREFIX}zoom-{m}.").into_bytes(),
+                    format!("Canceled meeting {MEETING_PREFIX}zoom-{m}.").into_bytes(),
                 ))
             }
             verb => Err(Error::Unsupported {
                 verb: Some(verb),
-                detail: "a meeting is read (Source), updated (Sink) or cancelled (Delete)"
+                detail: "a meeting is read (Source), updated (Sink) or canceled (Delete)"
                     .to_string(),
             }),
         }
@@ -812,7 +852,8 @@ impl Endpoint for MeetingById {
         let mut update = ActionSpec::new(Verb::Sink)
             .summary(
                 "Move or change the meeting: only what is given is sent to Zoom, and the answer \
-                 is the meeting Zoom then holds. Give at least one change.",
+                 is the meeting Zoom then holds. Give at least one change. Only the meeting's \
+                 host's account can.",
             )
             .input(binding())
             .input(
@@ -857,7 +898,10 @@ impl Endpoint for MeetingById {
             .action(fails(update))
             .action(fails(
                 ActionSpec::new(Verb::Delete)
-                    .summary("Cancel the meeting. A cancelled meeting is then not found.")
+                    .summary(
+                        "Cancel the meeting. Only its host's account can; a canceled meeting is \
+                         then not found.",
+                    )
                     .input(binding())
                     .input(teacher_spec())
                     .output(FACES[0]),
@@ -887,35 +931,46 @@ impl Zoom {
         gate_net(inv, &self.config.token_url())?;
         let Some(teacher) = teacher else {
             let url = url_for(&self.config.user_id);
+            let user_url = self.config.user_url(&self.config.user_id);
             gate_net(inv, &url)?;
+            gate_net(inv, &user_url)?;
             self.gate_shared(inv)?;
             return Ok(Account {
                 grant: Grant::Shared(self.credentials()?),
                 url,
+                user_url,
+                acting: format!("the configured Zoom user `{}`", self.config.user_id),
             });
         };
         let record = self.config.teacher_secret(teacher);
-        if let Target::Meeting(_) = target {
-            gate_net(inv, &url_for("me"))?;
-        }
+        let acting = format!("teacher `{teacher}`");
         gate_secret(inv, "read", &record)?;
         match self.teacher_record(&record)? {
             TeacherRecord::Shared { user_id } => {
-                let url = url_for(&path_segment(&user_id));
+                let user = path_segment(&user_id);
+                let url = url_for(&user);
+                let user_url = self.config.user_url(&user);
                 gate_net(inv, &url)?;
+                gate_net(inv, &user_url)?;
                 self.gate_shared(inv)?;
                 Ok(Account {
                     grant: Grant::Shared(self.credentials()?),
                     url,
+                    user_url,
+                    acting,
                 })
             }
             TeacherRecord::Own(app) => {
                 let url = url_for("me");
+                let user_url = self.config.user_url("me");
                 gate_net(inv, &url)?;
+                gate_net(inv, &user_url)?;
                 gate_secret(inv, "write", &record)?;
                 Ok(Account {
                     grant: Grant::Own(app),
                     url,
+                    user_url,
+                    acting,
                 })
             }
         }
@@ -1041,7 +1096,37 @@ impl Zoom {
                     .await?;
                 (answer.access_token, answer.expires_in)
             }
-            Grant::Own(app) => self.refresh(token_url, app, account, now).await?,
+            Grant::Own(app) => {
+                // One refresh per teacher at a time. A call that waited finds the token the
+                // other minted (when there is a clock to keep it by), or else starts from the
+                // record as the other stored it, never from the refresh token Zoom just retired.
+                let lock = self.refreshing.for_record(&app.record);
+                let _held = lock.lock().await;
+                if let Some(token) = now.and_then(|now| self.tokens.get(key, now.as_millis())) {
+                    return Ok(token);
+                }
+                let latest = match self.teacher_record(&app.record)? {
+                    TeacherRecord::Own(latest) => latest,
+                    TeacherRecord::Shared { .. } => {
+                        return Err(Error::Endpoint(format!(
+                            "secret `{}` changed during the call from a teacher's own Zoom app \
+                             to a shared-account user; try again",
+                            app.record
+                        )))
+                    }
+                };
+                let answer = self.refresh(token_url, &latest, account, now).await?;
+                *app.refresh_token.lock().unwrap_or_else(|e| e.into_inner()) = latest
+                    .refresh_token
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                if let (Some(now), Some(expires_in)) = (now, answer.1) {
+                    self.tokens
+                        .put(key.clone(), &answer.0, now.as_millis(), expires_in);
+                }
+                return Ok(answer.0);
+            }
         };
         if let (Some(now), Some(expires_in)) = (now, expires_in) {
             self.tokens
@@ -1076,7 +1161,7 @@ impl Zoom {
                 &app.client_id,
                 &app.client_secret,
                 form,
-                &account.secrets(),
+                &[account.secrets(), vec![current.clone()]].concat(),
                 now,
             )
             .await?;
@@ -1185,16 +1270,10 @@ impl Zoom {
         secrets.push(token.to_string());
         macro_rules! send {
             ($method:expr, $body:expr, $what:expr, $cached:expr) => {
-                self.exchange(
-                    $method,
-                    &account.url,
-                    token,
-                    $body,
-                    $what,
-                    &secrets,
-                    $cached,
-                    now,
-                )
+                send!($method, &account.url, $body, $what, $cached)
+            };
+            ($method:expr, $url:expr, $body:expr, $what:expr, $cached:expr) => {
+                self.exchange($method, $url, token, $body, $what, &secrets, $cached, now)
             };
         }
         match call {
@@ -1207,26 +1286,92 @@ impl Zoom {
                 meeting.attendees = request.attendees.clone();
                 Ok(Outcome::Meeting(meeting))
             }
-            Call::Get => match send!(Method::Get, None, call.what(), cached).await? {
-                None => Ok(Outcome::TokenRefused),
-                Some(v) => Ok(Outcome::Meeting(parse_meeting(&v, call.what())?)),
-            },
-            Call::Update(body) => {
-                if send!(Method::Patch, Some(body), call.what(), cached)
-                    .await?
-                    .is_none()
-                {
-                    return Ok(Outcome::TokenRefused);
+            Call::Get { host_only: false } => {
+                match send!(Method::Get, None, call.what(), cached).await? {
+                    None => Ok(Outcome::TokenRefused),
+                    Some(v) => Ok(Outcome::Meeting(parse_meeting(&v, call.what())?)),
                 }
-                let v = send!(Method::Get, None, "get-meeting", false)
+            }
+            _ => {
+                // The account must host the meeting. Who it acts for comes first, so only that
+                // read can meet a stale cached token; nothing has been changed by then.
+                let Some(user) =
+                    send!(Method::Get, &account.user_url, None, "get-user", cached).await?
+                else {
+                    return Ok(Outcome::TokenRefused);
+                };
+                let user_id = response_string(&user, "get-user", "id")?;
+                let current = send!(Method::Get, None, "get-meeting", false)
+                    .await?
+                    .ok_or_else(|| Error::Refused("zoom get-meeting returned 401".to_string()))?;
+                let host_id = response_string(&current, "get-meeting", "host_id")?;
+                if host_id != user_id {
+                    let id = parse_meeting(&current, "get-meeting")?.id;
+                    return Err(Error::Denied(
+                        format!(
+                            "{} does not host meeting {MEETING_PREFIX}zoom-{id}: another Zoom \
+                             user does, so only that meeting's own teacher can read its host \
+                             details, change it or cancel it",
+                            account.acting
+                        )
+                        .into(),
+                    ));
+                }
+                self.act(account, call, current, token, &secrets, now).await
+            }
+        }
+    }
+
+    /// A call on a meeting its account hosts, `current` being the meeting as just read.
+    async fn act(
+        &self,
+        account: &Account,
+        call: &Call<'_>,
+        current: Value,
+        token: &str,
+        secrets: &[String],
+        now: Option<Time>,
+    ) -> Result<Outcome> {
+        macro_rules! send {
+            ($method:expr, $body:expr, $what:expr) => {
+                self.exchange(
+                    $method,
+                    &account.url,
+                    token,
+                    $body,
+                    $what,
+                    secrets,
+                    false,
+                    now,
+                )
+            };
+        }
+        match call {
+            Call::Create(_) | Call::Get { host_only: false } => Err(Error::Endpoint(
+                "zoom: not a call on an existing meeting".to_string(),
+            )),
+            Call::Get { host_only: true } => {
+                Ok(Outcome::Meeting(parse_meeting(&current, "get-meeting")?))
+            }
+            Call::Update(body) => {
+                send!(Method::Patch, Some(body), call.what())
+                    .await?
+                    .ok_or_else(|| {
+                        Error::Refused("zoom update-meeting returned 401".to_string())
+                    })?;
+                let v = send!(Method::Get, None, "get-meeting")
                     .await?
                     .ok_or_else(|| Error::Refused("zoom get-meeting returned 401".to_string()))?;
                 Ok(Outcome::Meeting(parse_meeting(&v, "get-meeting")?))
             }
-            Call::Cancel => match send!(Method::Delete, None, call.what(), cached).await? {
-                None => Ok(Outcome::TokenRefused),
-                Some(_) => Ok(Outcome::Cancelled),
-            },
+            Call::Cancel => {
+                send!(Method::Delete, None, call.what())
+                    .await?
+                    .ok_or_else(|| {
+                        Error::Refused("zoom cancel-meeting returned 401".to_string())
+                    })?;
+                Ok(Outcome::Canceled)
+            }
         }
     }
 
@@ -1420,15 +1565,13 @@ fn gate_secret(inv: &Invocation<'_>, action: &str, name: &str) -> Result<()> {
 /// A URL path segment: ASCII letters, digits and `-._~` pass; every other byte is
 /// percent-encoded, so a user id such as an email address is one segment.
 fn path_segment(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
-            out.push(byte as char);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
+    /// Every byte but RFC 3986's unreserved characters.
+    const SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    percent_encoding::utf8_percent_encode(value, SEGMENT).to_string()
 }
 
 /// An optional `xsd:boolean`: `true`, `false`, `1` or `0`.
@@ -1631,13 +1774,6 @@ fn setting_specs(new: bool) -> Vec<ArgSpec> {
         } else {
             recording
         },
-        ArgSpec::new("captions")
-            .summary(
-                "not settable per Zoom meeting: Zoom applies the host's account or user \
-                 captions setting, so any value is refused",
-            )
-            .class(XSD_BOOLEAN)
-            .optional(),
     ]
 }
 

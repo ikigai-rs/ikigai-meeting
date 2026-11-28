@@ -148,6 +148,9 @@ const TOKEN_PATH: &str = "/oauth/token";
 const MEETINGS_PATH: &str = "/v2/users/me/meetings";
 /// One meeting's path, and the resource that names it.
 const MEETING_PATH: &str = "/v2/meetings/88899900011";
+/// The user the shared account acts for, read before a meeting is changed or canceled: its id
+/// must be the meeting's `host_id`.
+const USER_PATH: &str = "/v2/users/me";
 const MEETING_ID: &str = "meeting-id";
 const MEETING_BINDING: &str = "zoom-88899900011";
 const JOIN_URL: &str = "https://zoom.us/j/88899900011?pwd=abc";
@@ -394,12 +397,14 @@ fn respond(method: &str, path: &str, authorization: &str, request: &[u8]) -> Rep
                 }
             }
         }
-        // One meeting as a resource (ledger #4519): read, update (204, then read) and cancel.
+        // One meeting as a resource (ledger #4519): read, update (204, then read) and cancel,
+        // each change only after the account's user is shown to be the meeting's host.
+        ("GET", USER_PATH) => json(200, "OK", r#"{"id":"u-stub"}"#.to_string()),
         ("GET", MEETING_PATH) => json(
             200,
             "OK",
             serde_json::json!({
-                "id":88899900011u64, "type":2, "join_url":JOIN_URL,
+                "id":88899900011u64, "type":2, "host_id":"u-stub", "join_url":JOIN_URL,
                 "start_url":"https://zoom.us/s/88899900011?zak=HOST-SECRET",
                 "password":"a1b2c3", "start_time":"2026-01-01T00:00:00Z",
                 "topic":TOPIC, "duration":30
@@ -712,10 +717,12 @@ fn conforms() {
     let firings = 2 * ENTRIES.len() + PROBE_FIRINGS;
     // The meeting resource, through its fixtures: Source fires twice (the Turtle and the
     // text face), each a token exchange and a read; Sink fires twice, each a token exchange,
-    // an update and a read of what Zoom then holds. Delete is fired by no probe. The kernel
-    // has no clock, so no token is cached: one exchange per firing.
+    // a read of the account's user, a read of the meeting (its host must be that user), an
+    // update and a read of what Zoom then holds. Delete is fired by no probe. The kernel has
+    // no clock, so no token is cached: one exchange per firing.
     let resource_firings = 4;
-    let resource_calls = 2 + 2 * 2;
+    let resource_calls = 2 + 2 * 3;
+    let user_calls = 2;
     assert_eq!(
         stub.hits(TOKEN_PATH),
         firings + resource_firings,
@@ -723,9 +730,10 @@ fn conforms() {
     );
     assert_eq!(stub.hits(MEETINGS_PATH), firings, "one meeting per firing");
     assert_eq!(stub.hits(MEETING_PATH), resource_calls);
+    assert_eq!(stub.hits(USER_PATH), user_calls);
     assert_eq!(
         stub.connections(),
-        2 * firings + resource_firings + resource_calls
+        2 * firings + resource_firings + resource_calls + user_calls
     );
     assert_eq!(
         secrets.reads(),
@@ -735,7 +743,10 @@ fn conforms() {
     for r in stub.received() {
         let path = r.path.split('?').next().unwrap_or(&r.path);
         assert!(
-            path == TOKEN_PATH || path == MEETINGS_PATH || path == MEETING_PATH,
+            path == TOKEN_PATH
+                || path == MEETINGS_PATH
+                || path == MEETING_PATH
+                || path == USER_PATH,
             "an unscripted route was requested: {}",
             r.path
         );
@@ -988,14 +999,14 @@ fn the_meeting_resource_serves_its_declared_faces_and_denies_first() {
     assert_eq!(learner["meeting"], name.as_str());
 
     assert_eq!(outputs(Verb::Delete), [FACES[0]]);
-    let cancelled = call(Verb::Delete, &[], &root).expect("cancels");
+    let canceled = call(Verb::Delete, &[], &root).expect("cancels");
     assert_eq!(
-        ikigai_conformance::rdf::bare_media_type(&cancelled.repr_type.media_type),
+        ikigai_conformance::rdf::bare_media_type(&canceled.repr_type.media_type),
         FACES[0]
     );
     assert_eq!(
-        String::from_utf8(cancelled.bytes).unwrap(),
-        format!("Cancelled meeting {name}.")
+        String::from_utf8(canceled.bytes).unwrap(),
+        format!("Canceled meeting {name}.")
     );
 }
 

@@ -49,6 +49,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Parse the target URLs' host for the per-host net capability check (ikigai_http::net_allows).
 url = "2"
+# A user id (an email address) as one URL path segment. Already in the graph through `url`.
+percent-encoding = "2"
+# An async lock per teacher record, so two refreshes of one rotating refresh token never race
+# (`futures_util::lock::Mutex`). Already in the graph through ikigai-http, with `std`.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # Calendar validation and bundled IANA rules, including in browser hosts (no system clock).
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 chrono-tz = "0.10"

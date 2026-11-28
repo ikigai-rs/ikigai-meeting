@@ -380,9 +380,12 @@ fn sink_moves_the_meeting_and_answers_the_meeting_zoom_now_holds() {
     assert_eq!(v["start_time"], "2026-12-02T17:00:00Z");
     assert_eq!(v["duration"], 45);
     assert_eq!(v["topic"], "Week 1 (moved)");
+    // The account's user, then the meeting (its host must be that user), then the update.
     let api = zoom.api();
-    assert_eq!(api[0].method, Method::Patch, "{api:?}");
-    let sent = api[0].json();
+    assert_eq!(api[0].url, "https://api.zoom.us/v2/users/me", "{api:?}");
+    assert_eq!(api[1].method, Method::Get, "{api:?}");
+    assert_eq!(api[2].method, Method::Patch, "{api:?}");
+    let sent = api[2].json();
     assert_eq!(sent["start_time"], "2026-12-02T17:00:00Z");
     assert_eq!(sent["timezone"], "America/New_York");
     // An update sends what changed and nothing else: no settings were given, so none are
@@ -391,7 +394,7 @@ fn sink_moves_the_meeting_and_answers_the_meeting_zoom_now_holds() {
     assert!(sent.get("type").is_none(), "{sent}");
     assert!(sent.get("recurrence").is_none(), "{sent}");
     assert!(sent.get("agenda").is_none(), "{sent}");
-    assert_eq!(api[1].method, Method::Get);
+    assert_eq!(api[3].method, Method::Get);
 }
 
 #[test]
@@ -405,12 +408,18 @@ fn an_update_with_nothing_to_change_is_refused_before_any_request() {
 }
 
 #[test]
-fn delete_cancels_and_a_cancelled_meeting_is_not_found() {
+fn delete_cancels_and_a_canceled_meeting_is_not_found() {
     let (zoom, keys) = (Zoom::new(), Arc::default());
     let k = kernel(&zoom, &keys);
     let out = text(issue(&k, Verb::Delete, MEETING, &[], &grants(&[])).expect("cancels"));
     assert!(out.contains(MEETING), "{out}");
-    assert_eq!(zoom.api()[0].method, Method::Delete);
+    let api = zoom.api();
+    assert_eq!(api.last().unwrap().method, Method::Delete, "{api:?}");
+    assert_eq!(
+        api.len(),
+        3,
+        "the user, the meeting, then the cancel: {api:?}"
+    );
     for verb in [Verb::Source, Verb::Delete] {
         let err = issue(&k, verb, MEETING, &[], &grants(&[])).unwrap_err();
         assert!(matches!(err, Error::NotFound(_)), "{verb:?}: {err:?}");
@@ -481,8 +490,9 @@ fn settings_are_arguments_with_safe_defaults() {
         &grants(&[]),
     )
     .expect("updates");
-    let sent = zoom.api()[2].json();
-    assert_eq!(sent, json!({"settings": {"waiting_room": false}}));
+    let api = zoom.api();
+    let patch = api.iter().find(|s| s.method == Method::Patch).unwrap();
+    assert_eq!(patch.json(), json!({"settings": {"waiting_room": false}}));
 }
 
 #[test]
@@ -558,10 +568,15 @@ fn a_teacher_with_their_own_app_refreshes_and_keeps_the_rotated_token() {
     assert_eq!(seen[0].authorization, "Basic YmVhLWNpZDpiZWEtY3NlYw==");
     assert_eq!(seen[1].url, "https://api.zoom.us/v2/users/me/meetings");
     assert_eq!(seen[1].authorization, "Bearer user-tok-1");
-    // The shared account's credentials were never read.
+    // The shared account's credentials were never read. Bea's record is read once to
+    // authorize the call, and once more under her refresh lock, so a refresh starts from the
+    // refresh token most recently stored.
     assert_eq!(
         *keys.reads.lock().unwrap(),
-        vec!["zoom-teacher-bea".to_string()]
+        vec![
+            "zoom-teacher-bea".to_string(),
+            "zoom-teacher-bea".to_string()
+        ]
     );
     let stored = keys.stored.lock().unwrap();
     assert_eq!(stored.len(), 1);
@@ -675,8 +690,14 @@ fn a_teacher_cannot_read_change_or_cancel_another_teachers_meeting() {
         denied(issue(&k, Verb::Sink, MEETING, &change, &cap).unwrap_err());
         denied(issue(&k, Verb::Delete, MEETING, &[("teacher", other)], &cap).unwrap_err());
         let api = zoom.api();
-        assert!(api.iter().all(|s| s.method == Method::Get), "{other}: {api:?}");
-        assert_eq!(zoom.meeting.lock().unwrap().as_ref().unwrap()["topic"], "Week 1");
+        assert!(
+            api.iter().all(|s| s.method == Method::Get),
+            "{other}: {api:?}"
+        );
+        assert_eq!(
+            zoom.meeting.lock().unwrap().as_ref().unwrap()["topic"],
+            "Week 1"
+        );
     }
 
     // Ada can: she reads her host link, moves the meeting and cancels it.

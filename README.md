@@ -47,12 +47,11 @@ per occurrence, the caller expanding any recurrence itself.
 | `join_before_host` | `xsd:boolean` | `false` | `settings.join_before_host` |
 | `authenticated_join` | `xsd:boolean` | `false` | `settings.meeting_authentication` |
 | `auto_recording` | `none`, `local` or `cloud` | `none` | `settings.auto_recording` |
-| `captions` | `xsd:boolean` | (refused) | none |
 
 A boolean is `true`, `false`, `1` or `0`. A value outside its type is an `InvalidArgument` that
-names the setting. `captions` is declared but refused with `Unsupported`, whatever its value:
-Zoom has no per-meeting captions setting, and applies the host's account or user setting. A
-caller that needs captions sets them there.
+names the setting. There is no `captions` argument: Zoom's meeting API has no per-meeting
+captions field, and applies the host's account or user captions setting. A caller that needs
+captions sets them there.
 
 ### One meeting as a resource
 
@@ -64,10 +63,21 @@ caller that needs captions sets them there.
   A setting not given is left as it is; the defaults above apply only to a new meeting. Giving
   nothing to change is a `MissingArgument`, before any request.
 - `Delete urn:meeting:id:{m} [teacher=…]`: cancels the meeting (`DELETE /meetings/{id}`) and
-  answers `Cancelled meeting urn:meeting:id:{m}.` as `text/plain`.
+  answers `Canceled meeting urn:meeting:id:{m}.` as `text/plain`.
+
+**Only the meeting's host's account reaches it.** Before an update, a cancel, or a read with
+`teacher=<t>`, the module reads who the account acts for (`GET /users/{user_id}` for a teacher
+on the shared account, `GET /users/me` for a teacher's own app or for no teacher) and the
+meeting, and refuses with `Denied` unless that user's `id` is the meeting's `host_id`. The
+denial names the teacher (or the configured user) and the meeting; it does not name the
+meeting's host, whose Zoom identity is not the caller's to see. So teacher `bea` cannot read
+the host link of, change or cancel a meeting teacher `ada` hosts, even through the shared
+account's token, and a call that names no teacher changes only the configured user's
+meetings. A read without `teacher` is not checked: it answers no host link without
+`urn:cap:meeting:host:id:{m}`.
 
 A `{m}` that is not `zoom-` and a Zoom meeting id's digits is an `InvalidArgument` naming `m`.
-A meeting Zoom does not hold (never made, or cancelled) is `NotFound`. Zoom documents a rate
+A meeting Zoom does not hold (never made, or canceled) is `NotFound`. Zoom documents a rate
 limit of 100 update requests a day.
 
 `start` must be a real calendar date and time. An explicit `Z` or numeric offset fixes the

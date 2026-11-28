@@ -22,14 +22,14 @@ and how to report a barrier. It is not a conformance claim. Adapted from the
   (`as=text/turtle`), or the full JSON envelope (`as=application/json`). People read the URL in
   an invite; the graph and JSON are read through other tools.
 - **One meeting** from `urn:meeting:id:{m}` (`src/lib.rs`): Source and Sink answer the same
-  three faces; Delete answers one sentence, `Cancelled meeting urn:meeting:id:{m}.`, as
+  three faces; Delete answers one sentence, `Canceled meeting urn:meeting:id:{m}.`, as
   `text/plain`. The JSON face carries the host link only for the presenter.
 - **Refusals** (`src/lib.rs`): a missing input (`MissingArgument`, naming it), an input outside
   its type (`InvalidArgument`, naming it and saying the form it takes, for example `not a list
   of email addresses (separated by commas, semicolons or whitespace)`), a capability that does
   not reach a host or a credential (`Denied`, naming the host or secret and the capability it
-  needs), a setting Zoom cannot apply per meeting (`Unsupported`, for `captions`, saying where to
-  set it), an update with nothing to change (`MissingArgument`, listing what can change), a
+  needs), a teacher acting on a meeting their account does not host (`Denied`, naming the
+  teacher and the meeting), an update with nothing to change (`MissingArgument`, listing what can change), a
   teacher record of the wrong shape (naming the record and the shapes it takes), a rotated
   refresh token the keystore could not store (saying the teacher must authorize the app again),
   and the outcome of a call to Zoom (`zoom <step> returned <status>…`, a body over its
