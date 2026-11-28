@@ -40,14 +40,38 @@ impl Seen {
 struct Zoom {
     seen: Mutex<Vec<Seen>>,
     meeting: Mutex<Option<Value>>,
+    /// The one refresh token Zoom still accepts for Bea's own app: each refresh rotates it, and
+    /// a refresh with an older one is refused, as Zoom does.
+    refresh: Mutex<u32>,
+}
+
+/// A future that is pending once, so two calls joined on one thread interleave at the token
+/// endpoint the way two concurrent calls would.
+struct YieldOnce(bool);
+
+impl std::future::Future for YieldOnce {
+    type Output = ();
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        if self.0 {
+            std::task::Poll::Ready(())
+        } else {
+            self.0 = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    }
 }
 
 impl Zoom {
     fn new() -> Arc<Zoom> {
         Arc::new(Zoom {
             seen: Mutex::default(),
+            refresh: Mutex::new(1),
             meeting: Mutex::new(Some(json!({
-                "id": 88899900011u64, "type": 2, "topic": "Week 1",
+                "id": 88899900011u64, "type": 2, "topic": "Week 1", "host_id": "u-ada",
                 "start_time": "2026-12-01T17:00:00Z", "duration": 60,
                 "timezone": "America/New_York", "agenda": "Intro",
                 "join_url": "https://zoom.us/j/88899900011?pwd=abc", "start_url": HOST_URL,
@@ -90,22 +114,49 @@ impl HttpTransport for Zoom {
         self.seen.lock().unwrap().push(Seen {
             method: request.method,
             url: request.url.clone(),
-            authorization,
+            authorization: authorization.clone(),
             body: request.body.clone(),
         });
         let path = request.url.split('?').next().unwrap().to_string();
+        if path.ends_with("/oauth/token") {
+            let form: HashMap<String, String> = url::form_urlencoded::parse(&request.body)
+                .into_owned()
+                .collect();
+            if form.get("grant_type").map(String::as_str) != Some("refresh_token") {
+                let body = json!({"access_token": "tok-1", "expires_in": 3600});
+                return Ok(answer(200, Some(body)));
+            }
+            // Read the refresh token Zoom accepts, answer later: a second refresh that read
+            // the same one before the first rotated it is the race a lock must prevent.
+            let valid = *self.refresh.lock().unwrap();
+            YieldOnce(false).await;
+            let mut current = self.refresh.lock().unwrap();
+            if form["refresh_token"] != format!("refresh-{valid}") || *current != valid {
+                return Ok(answer(
+                    400,
+                    Some(json!({"reason": "Invalid Token!", "error": "invalid_grant"})),
+                ));
+            }
+            *current += 1;
+            let body = json!({
+                "access_token": "user-tok-1", "expires_in": 3600,
+                "refresh_token": format!("refresh-{}", *current),
+            });
+            return Ok(answer(200, Some(body)));
+        }
         let mut meeting = self.meeting.lock().unwrap();
         Ok(match (request.method, path.as_str()) {
-            (Method::Post, p) if p.ends_with("/oauth/token") => {
-                let form: HashMap<String, String> = url::form_urlencoded::parse(&request.body)
-                    .into_owned()
-                    .collect();
-                let mut body = json!({"access_token": "tok-1", "expires_in": 3600});
-                if form.get("grant_type").map(String::as_str) == Some("refresh_token") {
-                    body["access_token"] = json!("user-tok-1");
-                    body["refresh_token"] = json!("refresh-2");
-                }
-                answer(200, Some(body))
+            // Who each account's token acts for: the shared account's configured user (`me`)
+            // is Ada; Bea's own app is Bea; Carl is another user of the shared account.
+            (Method::Get, "https://api.zoom.us/v2/users/me") => match authorization.as_str() {
+                "Bearer user-tok-1" => answer(200, Some(json!({"id": "u-bea"}))),
+                _ => answer(200, Some(json!({"id": "u-ada"}))),
+            },
+            (Method::Get, "https://api.zoom.us/v2/users/ada%40example.invalid") => {
+                answer(200, Some(json!({"id": "u-ada"})))
+            }
+            (Method::Get, "https://api.zoom.us/v2/users/carl%40example.invalid") => {
+                answer(200, Some(json!({"id": "u-carl"})))
             }
             (Method::Post, p) if p.ends_with("/meetings") => {
                 let sent: Value = serde_json::from_slice(&request.body).unwrap();
@@ -173,6 +224,7 @@ impl SecretReader for Keystore {
             "zoom-client-id" => b"cid-1".to_vec(),
             "zoom-client-secret" => b"csec-1".to_vec(),
             "zoom-teacher-ada" => br#"{"user_id":"ada@example.invalid"}"#.to_vec(),
+            "zoom-teacher-carl" => br#"{"user_id":"carl@example.invalid"}"#.to_vec(),
             "zoom-teacher-bea" => {
                 br#"{"client_id":"bea-cid","client_secret":"bea-csec","refresh_token":"refresh-1"}"#
                     .to_vec()
@@ -590,4 +642,115 @@ fn an_unknown_meeting_is_not_found() {
     )
     .unwrap_err();
     assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+}
+
+/// Every grant teacher `t` holds for their own account: the shared credentials, their record
+/// (read and write, for an own app's rotated refresh token) and their meetings' host links.
+fn teacher(t: &str) -> Capability {
+    grants(&[
+        &format!("urn:cap:secret:read:zoom-teacher-{t}"),
+        &format!("urn:cap:secret:write:zoom-teacher-{t}"),
+        &format!("urn:cap:meeting:host:teacher:{t}"),
+    ])
+}
+
+#[test]
+fn a_teacher_cannot_read_change_or_cancel_another_teachers_meeting() {
+    // Ada hosts the meeting. Bea (her own app) and Carl (a user of the shared account) each
+    // hold every grant for their own account, and none of them reaches Ada's meeting.
+    for other in ["bea", "carl"] {
+        let (zoom, keys) = (Zoom::new(), Arc::<Keystore>::default());
+        let k = kernel(&zoom, &keys);
+        let cap = teacher(other);
+        let json_face = [("teacher", other), ("as", "application/json")];
+        let denied = |err: Error| {
+            assert!(matches!(err, Error::Denied(_)), "{other}: {err:?}");
+            let text = err.to_string();
+            assert!(text.contains(&format!("`{other}`")), "{text}");
+            assert!(text.contains(MEETING), "{text}");
+            assert!(!text.contains("HOST-SECRET"), "{text}");
+        };
+        denied(issue(&k, Verb::Source, MEETING, &json_face, &cap).unwrap_err());
+        let change = [("teacher", other), ("topic", "Taken over")];
+        denied(issue(&k, Verb::Sink, MEETING, &change, &cap).unwrap_err());
+        denied(issue(&k, Verb::Delete, MEETING, &[("teacher", other)], &cap).unwrap_err());
+        let api = zoom.api();
+        assert!(api.iter().all(|s| s.method == Method::Get), "{other}: {api:?}");
+        assert_eq!(zoom.meeting.lock().unwrap().as_ref().unwrap()["topic"], "Week 1");
+    }
+
+    // Ada can: she reads her host link, moves the meeting and cancels it.
+    let (zoom, keys) = (Zoom::new(), Arc::<Keystore>::default());
+    let k = kernel(&zoom, &keys);
+    let cap = teacher("ada");
+    let read = issue(
+        &k,
+        Verb::Source,
+        MEETING,
+        &[("teacher", "ada"), ("as", "application/json")],
+        &cap,
+    )
+    .expect("ada reads");
+    let v: Value = serde_json::from_slice(&read.bytes).unwrap();
+    assert_eq!(v["start_url"], HOST_URL);
+    issue(
+        &k,
+        Verb::Sink,
+        MEETING,
+        &[("teacher", "ada"), ("topic", "Week 1 (moved)")],
+        &cap,
+    )
+    .expect("ada updates");
+    assert_eq!(
+        zoom.meeting.lock().unwrap().as_ref().unwrap()["topic"],
+        "Week 1 (moved)"
+    );
+    issue(&k, Verb::Delete, MEETING, &[("teacher", "ada")], &cap).expect("ada cancels");
+    assert!(zoom.meeting.lock().unwrap().is_none());
+}
+
+#[test]
+fn a_change_without_a_teacher_acts_only_for_the_configured_user() {
+    // Carl holds the shared credentials, so he can call without naming a teacher; that acts
+    // for the configured user, Ada here, and only her meetings.
+    let (zoom, keys) = (Zoom::new(), Arc::<Keystore>::default());
+    zoom.meeting.lock().unwrap().as_mut().unwrap()["host_id"] = json!("u-carl");
+    let k = kernel(&zoom, &keys);
+    for (verb, args) in [
+        (Verb::Sink, &[("topic", "Taken over")][..]),
+        (Verb::Delete, &[][..]),
+    ] {
+        let err = issue(&k, verb, MEETING, args, &grants(&[])).unwrap_err();
+        assert!(matches!(err, Error::Denied(_)), "{verb:?}: {err:?}");
+    }
+    assert!(zoom.api().iter().all(|s| s.method == Method::Get));
+}
+
+#[test]
+fn two_refreshes_for_one_teacher_are_serialized() {
+    // Two calls for Bea at once: without a per-teacher lock both refresh with `refresh-1`, and
+    // Zoom refuses the second after the first rotates it.
+    let (zoom, keys) = (Zoom::new(), Arc::<Keystore>::default());
+    let k = kernel(&zoom, &keys);
+    let cap = teacher("bea");
+    let call = |topic: &'static str| {
+        let req = Request::new(Verb::Sink, Iri::parse("urn:meeting:schedule").unwrap())
+            .with_arg("topic", ArgRef::Inline(topic.as_bytes().to_vec()))
+            .with_arg("start", ArgRef::Inline(b"2026-12-01T17:00:00Z".to_vec()))
+            .with_arg("teacher", ArgRef::Inline(b"bea".to_vec()));
+        k.issue(req, &cap)
+    };
+    let (a, b) = block_on(async { futures::join!(call("A"), call("B")) });
+    a.expect("first call");
+    b.expect("second call");
+    let refreshes: Vec<String> = zoom
+        .seen()
+        .iter()
+        .filter(|s| s.url.ends_with("/oauth/token"))
+        .map(|s| s.form()["refresh_token"].clone())
+        .collect();
+    assert_eq!(refreshes, ["refresh-1", "refresh-2"]);
+    let stored = keys.stored.lock().unwrap();
+    let last: Value = serde_json::from_slice(&stored.last().unwrap().1).unwrap();
+    assert_eq!(last["refresh_token"], "refresh-3");
 }
